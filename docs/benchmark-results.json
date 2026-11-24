@@ -1,0 +1,96 @@
+{
+  "measuredAt": "2026-11-24T14:31:06Z",
+  "environment": {
+    "os": "macOS arm64",
+    "docker": "29.7.2",
+    "java": "Temurin 25.0.3",
+    "springBoot": "4.2.0",
+    "junit": "5.14.4",
+    "kafka": "4.1.0 single node, 3 partitions",
+    "redis": "7.4 single node with AOF"
+  },
+  "primaryDirectKafkaBenchmark": {
+    "runId": "DIRECT-1795534265829",
+    "configuration": {
+      "totalUniqueEvents": 10000,
+      "companyCount": 20,
+      "producerAcks": "all",
+      "producerIdempotence": true,
+      "redisPipelineMaxRecords": 500
+    },
+    "results": {
+      "producerAckedEventsPerSecond": 23703.57,
+      "directKafkaEndToEndEventsPerSecond": 11513.81,
+      "leaderboardP95Ms": 2.89,
+      "expectedPoints": 100000,
+      "observedPoints": 100000
+    },
+    "targetAssessment": {
+      "tenThousandEventsPerSecondMet": true,
+      "approximatelyFiveMsP95Met": true
+    }
+  },
+  "directKafkaRepeatedRuns": [
+    {
+      "runId": "DIRECT-1795533966265",
+      "producerAckedEventsPerSecond": 21386.72,
+      "directKafkaEndToEndEventsPerSecond": 12534.60,
+      "leaderboardP95Ms": 1.79
+    },
+    {
+      "runId": "DIRECT-1795534004800",
+      "producerAckedEventsPerSecond": 23004.43,
+      "directKafkaEndToEndEventsPerSecond": 13622.93,
+      "leaderboardP95Ms": 1.06
+    },
+    {
+      "runId": "DIRECT-1795534033797",
+      "producerAckedEventsPerSecond": 18248.31,
+      "directKafkaEndToEndEventsPerSecond": 12293.34,
+      "leaderboardP95Ms": 1.00
+    },
+    {
+      "runId": "DIRECT-1795534265829",
+      "producerAckedEventsPerSecond": 23703.57,
+      "directKafkaEndToEndEventsPerSecond": 11513.81,
+      "leaderboardP95Ms": 2.89
+    }
+  ],
+  "secondaryRestBenchmark": {
+    "runId": "LOAD-1795534286010",
+    "configuration": {
+      "totalUniqueEvents": 10000,
+      "concurrency": 100,
+      "companyCount": 20,
+      "duplicateCount": 1000,
+      "leaderboardSamples": 200,
+      "client": "Node.js fetch"
+    },
+    "results": {
+      "apiAcceptedEventsPerSecond": 9718.16,
+      "endToEndEventsPerSecond": 8713.37,
+      "backlogDrainEventsPerSecond": 8284.16,
+      "leaderboardP50Ms": 2.378,
+      "leaderboardP95Ms": 4.696,
+      "leaderboardMaxMs": 5.96,
+      "expectedPoints": 100000,
+      "pointsAfterDuplicates": 100000,
+      "duplicateProcessingCorrect": true,
+      "kafkaLagAfterDuplicates": 0
+    }
+  },
+  "httpIngressCrossCheck": {
+    "tool": "ApacheBench",
+    "requests": 10000,
+    "concurrency": 200,
+    "workload": "duplicate invoice events",
+    "requestsPerSecond": 14428.89,
+    "failedRequests": 0,
+    "consumerLagAfterBurst": 0
+  },
+  "baselineBeforeOptimization": {
+    "endToEndEventsPerSecond": 5602.61,
+    "leaderboardP95Ms": 5.051,
+    "note": "Used synchronous Kafka publish waits, one Redis round trip per event, 100-record consumer batches, and no producer batching tuning."
+  }
+}
