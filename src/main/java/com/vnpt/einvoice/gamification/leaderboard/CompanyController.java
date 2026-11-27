@@ -1,5 +1,6 @@
 package com.vnpt.einvoice.gamification.leaderboard;
 
+import com.vnpt.einvoice.gamification.api.CompanySummaryResponse;
 import com.vnpt.einvoice.gamification.api.DiscountResponse;
 import com.vnpt.einvoice.gamification.api.PointsResponse;
 import com.vnpt.einvoice.gamification.api.RankResponse;
@@ -29,5 +30,10 @@ public class CompanyController {
     @GetMapping("/api/companies/{companyId}/discount")
     DiscountResponse discount(@PathVariable String companyId) {
         return leaderboardService.discount(companyId);
+    }
+
+    @GetMapping("/api/companies/{companyId}/summary")
+    CompanySummaryResponse summary(@PathVariable String companyId) {
+        return leaderboardService.summary(companyId);
     }
 }

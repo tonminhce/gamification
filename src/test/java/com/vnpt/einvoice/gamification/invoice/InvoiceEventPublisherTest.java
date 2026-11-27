@@ -5,7 +5,8 @@ import com.vnpt.einvoice.gamification.api.InvoiceBatchAcceptedResponse;
 import com.vnpt.einvoice.gamification.api.InvoiceSimulationRequest;
 import com.vnpt.einvoice.gamification.event.InvoiceIssuedEvent;
 import com.vnpt.einvoice.gamification.exception.EventPublishException;
-import com.vnpt.einvoice.gamification.invoice.InvoiceEventPublisher;
+import com.vnpt.einvoice.gamification.exception.OverloadException;
+import com.vnpt.einvoice.gamification.metrics.RewardMetrics;
 import org.apache.kafka.common.KafkaException;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
@@ -74,5 +75,26 @@ class InvoiceEventPublisherTest {
 
         assertThrows(EventPublishException.class,
                 () -> publisher.publish(new InvoiceSimulationRequest("INV-1", "COMPANY-A")));
+    }
+
+    @Test
+    void rejectsRequestsWithOverloadExceptionWhenInFlightCapIsReached() {
+        CompletableFuture<org.springframework.kafka.support.SendResult<String, InvoiceIssuedEvent>> pending =
+                new CompletableFuture<>();
+        when(kafkaTemplate.send(eq("invoice-events"), any(), any())).thenReturn(pending);
+        InvoiceEventPublisher publisher = new InvoiceEventPublisher(
+                kafkaTemplate,
+                "invoice-events",
+                1,
+                RewardMetrics.noop()
+        );
+
+        publisher.publish(new InvoiceSimulationRequest("INV-1", "COMPANY-A"));
+        assertThrows(OverloadException.class,
+                () -> publisher.publish(new InvoiceSimulationRequest("INV-2", "COMPANY-A")));
+
+        pending.complete(null);
+        InvoiceAcceptedResponse afterRelease = publisher.publish(new InvoiceSimulationRequest("INV-3", "COMPANY-A"));
+        assertEquals("PUBLISHING", afterRelease.status());
     }
 }

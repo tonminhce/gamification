@@ -11,11 +11,13 @@ import org.springframework.http.MediaType;
 import org.springframework.test.web.servlet.MockMvc;
 import org.springframework.test.web.servlet.setup.MockMvcBuilders;
 
+import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyList;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
+import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.header;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
 
@@ -89,5 +91,17 @@ class ApiExceptionHandlerTest {
                         .content("{}"))
                 .andExpect(status().isUnsupportedMediaType())
                 .andExpect(jsonPath("$.status").value(415));
+    }
+
+    @Test
+    void overloadReturnsServiceUnavailableWithRetryAfterHeader() throws Exception {
+        when(publisher.publish(any())).thenThrow(new OverloadException("saturated"));
+
+        mvc.perform(post("/api/invoices/simulate")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"invoiceId\":\"INV-1\",\"companyId\":\"COMPANY-A\"}"))
+                .andExpect(status().isServiceUnavailable())
+                .andExpect(header().string("Retry-After", "1"))
+                .andExpect(jsonPath("$.status").value(503));
     }
 }

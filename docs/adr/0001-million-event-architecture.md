@@ -11,25 +11,22 @@ POC hiện tại đã chứng minh đường Java 25/Spring Boot 4 → Kafka →
 
 Kiến trúc “mỗi invoice → một Lua script → một Redis marker” chưa được chứng minh là phù hợp ở 1M/s. Stage 1 đã thay bằng batch API, 12 partitions và một Lua batch script dùng Redis Set. Stage 2A đã thêm reward-delta topic và leaderboard projector. Stage 2B đã thay Redis claim bằng Kafka Streams `exactly_once_v2`, RocksDB dedupe store có changelog và time-window aggregation 500 ms trước delta topic. Ở tốc độ 1M/s, mỗi event vẫn cần exact lookup và thao tác cập nhật, retention 24 giờ tạo ra 86,4 tỷ invoice IDs, còn Redis command execution vẫn tuần tự. Vì vậy cần thay đổi đơn vị xử lý và partition/coalesce, không chỉ tăng batch.
 
-### Trạng thái triển khai Stage 2B (2026-11-27)
+### Trạng thái triển khai Stage 2B+ (2026-11-28)
 
-Đã có trong POC:
+Đã hoàn thiện trong POC:
 
-- Hai hop `invoice-events → company-reward-deltas → Redis`, Streams `exactly_once_v2`.
-- Dedupe `invoiceId` trong persistent RocksDB store + changelog, có Bloom negative cache; đã kiểm chứng replay sau restart không tạo delta mới.
-- Window aggregation 500 ms, delta output có `deltaId`, `deltaPoints`, `windowStart`, `windowEnd`, `schemaVersion`.
-- Projector `isolation.level=read_committed`, batch Lua với delta Set, PENDING marker và TTL.
-- Commit interval 500 ms, 6 Streams threads; 12 threads và 100 ms commit bị loại sau đo.
-- Broker Kafka 4.4.0 thay 4.1.0 vì KAFKA-19888; Streams chỉ start sau khi topic được tạo.
-- 23 JUnit 5 test pass; ba run 1.000.000 event đạt 102.541,84 / 120.862,70 / 122.030,32 events/s end-to-end, p95 1,28–3,00 ms post-drain, đúng 10.000.000 điểm; duplicate và restart replay không tăng điểm.
+- Hai hop `invoice-events → company-reward-deltas → Redis`, Streams `exactly_once_v2`, broker Kafka 4.4.0.
+- Dedupe `invoiceId` trong bounded-retention RocksDB `WindowStore` (`24h` mặc định) + changelog, 2-generation rotating primitive Bloom cache, phát hiện conflict cùng `invoiceId` khác `companyId` và quarantine sang `invoice-events.DLT`.
+- `HighThroughputRocksDBConfig`: shared 256 MB `LRUCache`, 16 KB blocks, native SST Bloom filter, nén `LZ4` (`31 MB` cho 3,61M keys).
+- Window aggregation 500 ms với `TreeMap` index O(ready), `deltaId` deterministic dạng `partition:windowStart:companyId:seq`.
+- Projector `isolation.level=read_committed`, multi-partition grouping, per-partition offset checkpoint, daily-bucketed TTL delta Sets và `PENDING` recovery marker.
+- Read path 1-RTT `rank_and_score.lua` + 50 ms single-flight `top()` micro-cache; REST ingress dùng Java 25 Virtual Threads, `Semaphore` backpressure (`503 Retry-After: 1`) và Micrometer/Actuator metrics.
+- 36 test pass (bao gồm `GamificationEndToEndIntegrationTest` chạy trên Testcontainers Kafka 4.4.0 + Redis 7.4). Ba run 1M direct Kafka đạt **99.746,53 / 138.627,96 / 98.800,41 events/s** end-to-end (drain **175k–201k/s**), post-drain p95 **0,27–0,62 ms**, under-load p95 **13,55–17,19 ms**; 500k REST batch đạt **142.788,10 accepted/s** (**96.606,04 E2E/s**, p95 **1,05 ms**); restore 3,61M keys sau restart hoàn tất trong **33,97 s** với 0 điểm trùng.
 
-Chưa đạt hoặc chưa làm so với ADR:
+Còn mở cho Stage 3 (cluster production):
 
-- Chưa lên 64 partitions/RF3; POC dùng 12 partitions, RF1.
-- `selectKey(companyId)` chưa tạo repartition topic, nên delta của một company có thể nằm nhiều partition.
-- `deltaId` chứa UUID, chưa deterministic theo window/company.
-- Dedupe store chưa có retention/TTL, chưa có rebuild drill hay chaos test; Bloom 4M keys/task là cấu hình POC.
-- Chưa chạy gate 15 phút sustained, p95 dưới concurrent read, freshness, failover; chưa có capacity run 300k/s hay 1M/s.
+- Scale lên 64–128 partitions/RF3 multi-broker và external LWT ledger nếu cần đổi partition count động trong retention window.
+- Dedicated Redis HA + automated snapshot/manifest rebuild drill, chaos failover drill và sustained soak test 15–30 phút ở 300k/s–1M/s.
 
 ## Decision
 

@@ -1,13 +1,12 @@
-import com.fasterxml.jackson.databind.JsonNode;
-import com.fasterxml.jackson.databind.ObjectMapper;
-import com.fasterxml.jackson.databind.json.JsonMapper;
-import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule;
-import com.vnpt.einvoice.gamification.event.InvoiceIssuedEvent;
 import org.apache.kafka.clients.producer.KafkaProducer;
 import org.apache.kafka.clients.producer.ProducerConfig;
 import org.apache.kafka.clients.producer.ProducerRecord;
 import org.apache.kafka.common.serialization.StringSerializer;
-import org.springframework.kafka.support.serializer.JsonSerializer;
+import org.springframework.kafka.support.serializer.JacksonJsonSerializer;
+import tools.jackson.databind.JsonNode;
+import tools.jackson.databind.json.JsonMapper;
+
+import com.vnpt.einvoice.gamification.event.InvoiceIssuedEvent;
 
 import java.net.URI;
 import java.net.http.HttpClient;
@@ -20,23 +19,30 @@ import java.util.Comparator;
 import java.util.List;
 import java.util.Properties;
 import java.util.UUID;
+import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
+import java.util.concurrent.ThreadLocalRandom;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 public class KafkaLoadProducer {
     public static void main(String[] args) throws Exception {
-        int total = args.length > 0 ? Integer.parseInt(args[0]) : 10_000;
+        int total = args.length > 0 ? Integer.parseInt(args[0]) : 100_000;
         int companies = args.length > 1 ? Integer.parseInt(args[1]) : 20;
         String bootstrap = args.length > 2 ? args[2] : "localhost:9092";
         String topic = args.length > 3 ? args[3] : "invoice-events";
         String api = args.length > 4 ? args[4] : "http://localhost:8080";
+        int duplicateReplayCount = args.length > 5 ? Integer.parseInt(args[5]) : Math.min(10_000, total);
+        int concurrentReadThreads = args.length > 6 ? Integer.parseInt(args[6]) : 8;
         String runId = "DIRECT-" + System.currentTimeMillis();
 
-        ObjectMapper mapper = JsonMapper.builder()
-                .addModule(new JavaTimeModule())
-                .build();
+        JsonMapper mapper = JsonMapper.builder().build();
         HttpClient httpClient = HttpClient.newBuilder()
                 .version(HttpClient.Version.HTTP_1_1)
                 .build();
+
+        long baselinePoints = totalPoints(httpClient, mapper, api);
 
         Properties properties = new Properties();
         properties.put(ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, bootstrap);
@@ -48,8 +54,29 @@ public class KafkaLoadProducer {
         properties.put(ProducerConfig.COMPRESSION_TYPE_CONFIG, "lz4");
         properties.put(ProducerConfig.BUFFER_MEMORY_CONFIG, 67_108_864);
 
-        JsonSerializer<InvoiceIssuedEvent> serializer = new JsonSerializer<>(mapper);
-        serializer.setAddTypeInfo(true);
+        JacksonJsonSerializer<InvoiceIssuedEvent> serializer =
+                new JacksonJsonSerializer<InvoiceIssuedEvent>(mapper).noTypeInfo();
+
+        AtomicBoolean loadRunning = new AtomicBoolean(true);
+        List<Double> concurrentReadLatencies = new CopyOnWriteArrayList<>();
+        ExecutorService readerPool = Executors.newFixedThreadPool(concurrentReadThreads);
+        for (int r = 0; r < concurrentReadThreads; r++) {
+            readerPool.submit(() -> {
+                while (loadRunning.get()) {
+                    try {
+                        long t0 = System.nanoTime();
+                        leaderboardRequest(httpClient, api);
+                        concurrentReadLatencies.add((System.nanoTime() - t0) / 1_000_000.0);
+                        Thread.sleep(5);
+                    } catch (InterruptedException ignored) {
+                        Thread.currentThread().interrupt();
+                        break;
+                    } catch (Exception ignored) {
+                    }
+                }
+            });
+        }
+
         List<Future<?>> futures = new ArrayList<>(total);
         long producerStart = System.nanoTime();
         try (KafkaProducer<String, InvoiceIssuedEvent> producer = new KafkaProducer<>(
@@ -57,16 +84,18 @@ public class KafkaLoadProducer {
                 new StringSerializer(),
                 serializer
         )) {
+            Instant batchTs = Instant.now();
+            ThreadLocalRandom rng = ThreadLocalRandom.current();
             for (int i = 0; i < total; i++) {
                 String invoiceId = runId + "-" + i;
                 String companyId = runId + "-COMPANY-" + (i % companies);
                 InvoiceIssuedEvent event = new InvoiceIssuedEvent(
-                        UUID.randomUUID().toString(),
+                        new UUID(rng.nextLong(), rng.nextLong()).toString(),
                         InvoiceIssuedEvent.TYPE,
                         InvoiceIssuedEvent.SCHEMA_VERSION,
                         invoiceId,
                         companyId,
-                        Instant.now()
+                        batchTs
                 );
                 futures.add(producer.send(new ProducerRecord<>(topic, invoiceId, event)));
             }
@@ -75,39 +104,78 @@ public class KafkaLoadProducer {
             }
         }
         long producerEnd = System.nanoTime();
-        long pointsAtProducerEnd = totalPoints(httpClient, mapper, api);
+        long pointsAtProducerEnd = totalPoints(httpClient, mapper, api) - baselinePoints;
 
-        long expectedPoints = total * 10L;
-        long deadline = System.nanoTime() + Duration.ofSeconds(60).toNanos();
-        long observedPoints;
+        long expectedAddedPoints = total * 10L;
+        long expectedTotalPoints = baselinePoints + expectedAddedPoints;
+        long deadline = System.nanoTime() + Duration.ofSeconds(120).toNanos();
+        long observedTotalPoints;
         while (true) {
-            observedPoints = totalPoints(httpClient, mapper, api);
-            if (observedPoints >= expectedPoints || System.nanoTime() >= deadline) {
+            observedTotalPoints = totalPoints(httpClient, mapper, api);
+            if (observedTotalPoints >= expectedTotalPoints || System.nanoTime() >= deadline) {
                 break;
             }
             Thread.sleep(25);
         }
         long endToEndEnd = System.nanoTime();
-        if (observedPoints != expectedPoints) {
-            throw new IllegalStateException("Expected " + expectedPoints + " points, observed " + observedPoints);
+        loadRunning.set(false);
+        readerPool.shutdownNow();
+
+        if (observedTotalPoints != expectedTotalPoints) {
+            throw new IllegalStateException("Expected " + expectedTotalPoints + " points, observed " + observedTotalPoints);
+        }
+
+        // Verify duplicate replay adds zero points
+        if (duplicateReplayCount > 0) {
+            List<Future<?>> dupFutures = new ArrayList<>(duplicateReplayCount);
+            try (KafkaProducer<String, InvoiceIssuedEvent> dupProducer = new KafkaProducer<>(
+                    properties,
+                    new StringSerializer(),
+                    new JacksonJsonSerializer<InvoiceIssuedEvent>(mapper).noTypeInfo()
+            )) {
+                Instant dupTs = Instant.now();
+                for (int i = 0; i < duplicateReplayCount; i++) {
+                    String invoiceId = runId + "-" + i;
+                    String companyId = runId + "-COMPANY-" + (i % companies);
+                    InvoiceIssuedEvent event = new InvoiceIssuedEvent(
+                            UUID.randomUUID().toString(),
+                            InvoiceIssuedEvent.TYPE,
+                            InvoiceIssuedEvent.SCHEMA_VERSION,
+                            invoiceId,
+                            companyId,
+                            dupTs
+                    );
+                    dupFutures.add(dupProducer.send(new ProducerRecord<>(topic, invoiceId, event)));
+                }
+                for (Future<?> f : dupFutures) {
+                    f.get();
+                }
+            }
+            Thread.sleep(1_500);
+            long afterDupPoints = totalPoints(httpClient, mapper, api);
+            if (afterDupPoints != expectedTotalPoints) {
+                throw new IllegalStateException("Duplicate replay inflated points: " + afterDupPoints);
+            }
         }
 
         for (int i = 0; i < 20; i++) {
             leaderboardRequest(httpClient, api);
         }
-        List<Double> latencies = new ArrayList<>(200);
+        List<Double> postDrainLatencies = new ArrayList<>(200);
         for (int i = 0; i < 200; i++) {
             long start = System.nanoTime();
             leaderboardRequest(httpClient, api);
-            latencies.add((System.nanoTime() - start) / 1_000_000.0);
+            postDrainLatencies.add((System.nanoTime() - start) / 1_000_000.0);
         }
-        latencies.sort(Comparator.naturalOrder());
+        postDrainLatencies.sort(Comparator.naturalOrder());
+
+        List<Double> sortedConcurrent = new ArrayList<>(concurrentReadLatencies);
+        sortedConcurrent.sort(Comparator.naturalOrder());
 
         double producerSeconds = (producerEnd - producerStart) / 1_000_000_000.0;
         double endToEndSeconds = (endToEndEnd - producerStart) / 1_000_000_000.0;
         double drainSeconds = (endToEndEnd - producerEnd) / 1_000_000_000.0;
-        long backlogAtProducerEnd = (expectedPoints - pointsAtProducerEnd) / 10L;
-        double p95 = latencies.get((int) Math.ceil(latencies.size() * 0.95) - 1);
+        long backlogAtProducerEnd = (expectedAddedPoints - pointsAtProducerEnd) / 10L;
 
         System.out.println(mapper.writerWithDefaultPrettyPrinter().writeValueAsString(new Result(
                 runId,
@@ -115,16 +183,24 @@ public class KafkaLoadProducer {
                 companies,
                 round(total / producerSeconds),
                 round(total / endToEndSeconds),
-                round(p95),
-                expectedPoints,
-                observedPoints,
+                round(percentile(postDrainLatencies, 0.95)),
+                sortedConcurrent.isEmpty() ? null : round(percentile(sortedConcurrent, 0.95)),
+                sortedConcurrent.isEmpty() ? null : round(percentile(sortedConcurrent, 0.99)),
+                sortedConcurrent.size(),
+                expectedAddedPoints,
+                observedTotalPoints - baselinePoints,
                 pointsAtProducerEnd,
                 backlogAtProducerEnd,
-                backlogAtProducerEnd > 0 ? round(backlogAtProducerEnd / drainSeconds) : null
+                backlogAtProducerEnd > 0 ? round(backlogAtProducerEnd / drainSeconds) : null,
+                duplicateReplayCount
         )));
     }
 
-    private static long totalPoints(HttpClient client, ObjectMapper mapper, String api) throws Exception {
+    private static double percentile(List<Double> sorted, double p) {
+        return sorted.get(Math.min(sorted.size() - 1, Math.max(0, (int) Math.ceil(sorted.size() * p) - 1)));
+    }
+
+    private static long totalPoints(HttpClient client, JsonMapper mapper, String api) throws Exception {
         JsonNode body = mapper.readTree(leaderboardRequest(client, api));
         long points = 0;
         for (JsonNode entry : body.path("entries")) {
@@ -155,12 +231,16 @@ public class KafkaLoadProducer {
             int companies,
             double producerAckedEventsPerSecond,
             double directKafkaEndToEndEventsPerSecond,
-            double leaderboardP95Ms,
-            long expectedPoints,
-            long observedPoints,
+            double postDrainLeaderboardP95Ms,
+            Double underLoadLeaderboardP95Ms,
+            Double underLoadLeaderboardP99Ms,
+            int underLoadReadSamples,
+            long expectedAddedPoints,
+            long observedAddedPoints,
             long pointsAtProducerEnd,
             long backlogEventsAtProducerEnd,
-            Double backlogDrainEventsPerSecond
+            Double backlogDrainEventsPerSecond,
+            int duplicateReplayVerified
     ) {
     }
 }

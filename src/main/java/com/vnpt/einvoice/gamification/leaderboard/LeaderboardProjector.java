@@ -2,13 +2,16 @@ package com.vnpt.einvoice.gamification.leaderboard;
 
 import com.vnpt.einvoice.gamification.event.CompanyRewardDelta;
 import org.apache.kafka.clients.consumer.ConsumerRecord;
+import org.apache.kafka.common.TopicPartition;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.kafka.annotation.KafkaListener;
 import org.springframework.stereotype.Component;
 
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 
 @Component
 public class LeaderboardProjector {
@@ -27,26 +30,58 @@ public class LeaderboardProjector {
             return;
         }
 
-        List<CompanyRewardDelta> validDeltas = new ArrayList<>(records.size());
+        ConsumerRecord<String, CompanyRewardDelta> firstValid = null;
+        boolean singlePartition = true;
+        List<ConsumerRecord<String, CompanyRewardDelta>> validRecords = new ArrayList<>(records.size());
+
         for (ConsumerRecord<String, CompanyRewardDelta> record : records) {
             CompanyRewardDelta delta = record.value();
             if (valid(delta)) {
-                validDeltas.add(delta);
+                if (firstValid == null) {
+                    firstValid = record;
+                } else if (singlePartition
+                        && (record.partition() != firstValid.partition()
+                        || !record.topic().equals(firstValid.topic()))) {
+                    singlePartition = false;
+                }
+                validRecords.add(record);
             } else {
-                log.warn("Skipping invalid company reward delta at offset {}", record.offset());
+                log.warn(
+                        "Skipping invalid company reward delta at topic={} partition={} offset={}",
+                        record.topic(),
+                        record.partition(),
+                        record.offset()
+                );
             }
         }
-        if (validDeltas.isEmpty()) {
+
+        if (validRecords.isEmpty()) {
             return;
         }
 
-        ConsumerRecord<String, CompanyRewardDelta> first = records.getFirst();
-        String markerId = first.topic() + ":" + first.partition();
-        applyService.applyDeltas(validDeltas, markerId);
+        if (singlePartition) {
+            String markerId = firstValid.topic() + ":" + firstValid.partition();
+            applyService.applyPartitionBatch(validRecords, markerId);
+            return;
+        }
+
+        // Preserve strict single-partition ordering and marker isolation when a poll spans multiple partitions.
+        Map<TopicPartition, List<ConsumerRecord<String, CompanyRewardDelta>>> byPartition = new LinkedHashMap<>();
+        for (ConsumerRecord<String, CompanyRewardDelta> record : validRecords) {
+            byPartition.computeIfAbsent(
+                    new TopicPartition(record.topic(), record.partition()),
+                    ignored -> new ArrayList<>()
+            ).add(record);
+        }
+        for (Map.Entry<TopicPartition, List<ConsumerRecord<String, CompanyRewardDelta>>> entry : byPartition.entrySet()) {
+            TopicPartition tp = entry.getKey();
+            applyService.applyPartitionBatch(entry.getValue(), tp.topic() + ":" + tp.partition());
+        }
     }
 
     private boolean valid(CompanyRewardDelta delta) {
         return delta != null
+                && delta.schemaVersion() == CompanyRewardDelta.SCHEMA_VERSION
                 && delta.deltaId() != null
                 && !delta.deltaId().isBlank()
                 && delta.companyId() != null

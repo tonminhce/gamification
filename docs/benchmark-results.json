@@ -333,6 +333,105 @@
       "note": "Short 1M-event runs cross 100k/s end-to-end with exact points; the roadmap's 15-minute sustained run, concurrent-read p95 and failover drills are not tested. A 100k-event run is not a valid gate because fixed window/drain latency dominates it."
     }
   },
+  "stage2COptimized": {
+    "measuredAt": "2026-11-28T01:31:00Z",
+    "environment": {
+      "os": "macOS arm64 (Apple M4, 10 cores)",
+      "docker": "29.7.2",
+      "java": "OpenJDK 25.0.3 (Virtual Threads enabled)",
+      "springBoot": "4.2.0",
+      "kafka": "4.4.0 single node, 12 partitions",
+      "redis": "7.4.12 single node with AOF"
+    },
+    "configuration": {
+      "producerKey": "invoiceId",
+      "streamsThreads": 6,
+      "commitIntervalMs": 500,
+      "invoiceDedupe": "Bounded-retention RocksDB WindowStore (24h default) + 2-generation rotating primitive Bloom filter + conflict quarantine to DLT",
+      "rocksdb": "Shared 256 MB LRUCache, 16 KB blocks, native SST BloomFilter(10.0), LZ4 compression",
+      "window": "500 ms event-time, 100 ms in-memory-indexed wall-clock punctuation, deterministic sequence deltaId",
+      "projector": "12 batch listeners, read_committed, multi-partition grouping, offset checkpoint, daily TTL delta Sets, PENDING marker recovery",
+      "readPath": "Atomic 1-RTT rank_and_score.lua + 50 ms single-flight stale-while-revalidate top-N cache"
+    },
+    "directKafka1MRuns": [
+      {
+        "runId": "DIRECT-1795804229860",
+        "producerAckedEventsPerSecond": 106901.01,
+        "endToEndEventsPerSecond": 99746.53,
+        "backlogDrainEventsPerSecond": 201675.94,
+        "postDrainLeaderboardP95Ms": 0.62,
+        "underLoadLeaderboardP95Ms": 16.22,
+        "underLoadLeaderboardP99Ms": 37.59,
+        "underLoadReadSamples": 7042,
+        "expectedAddedPoints": 10000000,
+        "observedAddedPoints": 10000000,
+        "duplicateReplayVerified": 10000
+      },
+      {
+        "runId": "DIRECT-1795804243051",
+        "producerAckedEventsPerSecond": 160367.42,
+        "endToEndEventsPerSecond": 138627.96,
+        "backlogDrainEventsPerSecond": 186483.54,
+        "postDrainLeaderboardP95Ms": 0.27,
+        "underLoadLeaderboardP95Ms": 13.55,
+        "underLoadLeaderboardP99Ms": 30.18,
+        "underLoadReadSamples": 5595,
+        "expectedAddedPoints": 10000000,
+        "observedAddedPoints": 10000000,
+        "duplicateReplayVerified": 10000
+      },
+      {
+        "runId": "DIRECT-1795804253634",
+        "producerAckedEventsPerSecond": 106163.05,
+        "endToEndEventsPerSecond": 98800.41,
+        "backlogDrainEventsPerSecond": 175548.56,
+        "postDrainLeaderboardP95Ms": 0.34,
+        "underLoadLeaderboardP95Ms": 17.19,
+        "underLoadLeaderboardP99Ms": 35.66,
+        "underLoadReadSamples": 6741,
+        "expectedAddedPoints": 10000000,
+        "observedAddedPoints": 10000000,
+        "duplicateReplayVerified": 10000
+      }
+    ],
+    "restBatch500kRun": {
+      "runId": "REST-1795804267004",
+      "totalUniqueEvents": 500000,
+      "batchSize": 1000,
+      "concurrency": 24,
+      "apiAcceptedEventsPerSecond": 142788.10,
+      "restEndToEndEventsPerSecond": 96606.04,
+      "leaderboardP95Ms": 1.05,
+      "overload503Retries": 83,
+      "expectedAddedPoints": 5000000,
+      "observedAddedPoints": 5000000
+    },
+    "restSingle10kRun": {
+      "runId": "REST-1795804273735",
+      "totalUniqueEvents": 10000,
+      "batchSize": 1,
+      "concurrency": 200,
+      "apiAcceptedEventsPerSecond": 5772.01,
+      "restEndToEndEventsPerSecond": 3941.61,
+      "leaderboardP95Ms": 1.21,
+      "expectedAddedPoints": 100000,
+      "observedAddedPoints": 100000
+    },
+    "correctnessAndEfficiency": {
+      "totalUniqueProcessedInSession": 3610000,
+      "bloomNegativeSkips": 3609996,
+      "bloomFalsePositives": 4,
+      "bloomAccuracyPercent": 99.9999,
+      "windowsEmitted": 64037,
+      "redisLuaBatches": 1968,
+      "writeCompressionToRedisLua": "1834:1",
+      "rocksdbDiskSize": "31 MB",
+      "gracefulRestartRestoreSeconds": 33.97,
+      "postRestartReplayAndConflictPointsAdded": 0,
+      "freshInvoiceAfterRestartPoints": 10,
+      "junitAndTestcontainersTests": "36 passed (including real Kafka+Redis E2E)"
+    }
+  },
   "baselineBeforeOptimization": {
     "endToEndEventsPerSecond": 5602.61,
     "leaderboardP95Ms": 5.051,

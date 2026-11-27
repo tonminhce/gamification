@@ -1,12 +1,11 @@
 package com.vnpt.einvoice.gamification.config;
 
 import com.vnpt.einvoice.gamification.event.InvoiceIssuedEvent;
+import org.apache.kafka.clients.admin.NewTopic;
 import org.springframework.beans.factory.annotation.Value;
-import org.springframework.boot.kafka.autoconfigure.KafkaProperties;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.kafka.config.TopicBuilder;
-import org.springframework.kafka.core.DefaultKafkaProducerFactory;
 import org.springframework.kafka.core.KafkaTemplate;
 import org.springframework.kafka.core.ProducerFactory;
 import org.springframework.kafka.listener.DefaultErrorHandler;
@@ -16,27 +15,29 @@ import org.springframework.util.backoff.FixedBackOff;
 public class KafkaConfig {
 
     @Bean
-    org.apache.kafka.clients.admin.NewTopic invoiceEventsTopic(
-            @Value("${app.kafka.topic}") String topic
+    NewTopic invoiceEventsTopic(
+            @Value("${app.kafka.topic}") String topic,
+            @Value("${app.kafka.partitions:12}") int partitions
     ) {
         return TopicBuilder.name(topic)
-                .partitions(12)
+                .partitions(partitions)
                 .replicas(1)
                 .build();
     }
 
     @Bean
-    org.apache.kafka.clients.admin.NewTopic companyRewardDeltasTopic(
-            @Value("${app.kafka.delta-topic}") String topic
+    NewTopic companyRewardDeltasTopic(
+            @Value("${app.kafka.delta-topic}") String topic,
+            @Value("${app.kafka.partitions:12}") int partitions
     ) {
         return TopicBuilder.name(topic)
-                .partitions(12)
+                .partitions(partitions)
                 .replicas(1)
                 .build();
     }
 
     @Bean
-    org.apache.kafka.clients.admin.NewTopic invoiceEventsDltTopic(
+    NewTopic invoiceEventsDltTopic(
             @Value("${app.kafka.dlt-topic}") String topic
     ) {
         return TopicBuilder.name(topic)
@@ -45,21 +46,17 @@ public class KafkaConfig {
                 .build();
     }
 
-    @Bean
-    ProducerFactory<String, InvoiceIssuedEvent> invoiceProducerFactory(KafkaProperties properties) {
-        return new DefaultKafkaProducerFactory<>(properties.buildProducerProperties());
-    }
-
+    @SuppressWarnings("unchecked")
     @Bean
     KafkaTemplate<String, InvoiceIssuedEvent> invoiceKafkaTemplate(
-            ProducerFactory<String, InvoiceIssuedEvent> producerFactory
+            ProducerFactory<?, ?> producerFactory
     ) {
-        return new KafkaTemplate<>(producerFactory);
+        return new KafkaTemplate<>((ProducerFactory<String, InvoiceIssuedEvent>) producerFactory);
     }
 
     @Bean
     DefaultErrorHandler kafkaErrorHandler() {
-        // Keep retrying without acknowledging so a failed update cannot be skipped.
+        // Keep retrying without acknowledging so a failed Redis update cannot be skipped.
         return new DefaultErrorHandler(new FixedBackOff(1_000L, Long.MAX_VALUE));
     }
 }

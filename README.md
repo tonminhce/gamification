@@ -1,8 +1,10 @@
-# VNPT e-Invoice Gamification POC — Stage 2B
+# VNPT e-Invoice Gamification POC — Optimized Stage 2B+
 
-A single Spring Boot application that simulates invoice issuance, publishes `INVOICE_ISSUED` events to Kafka, deduplicates and aggregates them in a Kafka Streams topology, and applies idempotent reward deltas to a Redis leaderboard through Lua.
+A single Spring Boot application that simulates invoice issuance, publishes `INVOICE_ISSUED` events to Kafka, deduplicates and aggregates them in a RocksDB-backed Kafka Streams topology, and applies idempotent reward deltas to a Redis leaderboard through Lua.
 
-Stack: Java 25, Spring Boot 4.2.0, Spring Kafka 4.2.0, Kafka 4.4.0, Kafka Streams 4.4.0, Redis 7.4, Maven, Docker Compose, JUnit 5.14.4.
+Stack: Java 25 (Virtual Threads), Spring Boot 4.2.0, Spring Kafka 4.2.0, Kafka 4.4.0, Kafka Streams 4.4.0, RocksDB, Redis 7.4, Micrometer/Actuator, Maven, Docker Compose, JUnit 6.1.3 & Testcontainers.
+
+> **For learning & presenting this system:** See [SYSTEM_DESIGN_AND_DEMO_GUIDE.md](SYSTEM_DESIGN_AND_DEMO_GUIDE.md) for a complete architectural breakdown, capacity math, optimization war story, and live 10–15 minute demo playbook.
 
 ## Phase 1 — Simple system design
 
@@ -54,8 +56,9 @@ flowchart LR
 | Key | Type | Purpose |
 |---|---|---|
 | `einv:leaderboard` | Sorted Set | Member = `companyId`, score = total points |
-| `einv:processed-deltas` | Set | Company reward delta IDs already applied |
-| `einv:delta-batch:{topic}:{partition}` | String JSON | Pending leaderboard delta batch with TTL |
+| `einv:processed-deltas:{epochDay}` | Set (TTL) | Daily-bucketed delta IDs already applied, with automatic `EXPIRE` |
+| `einv:projector-checkpoint:{topic}:{partition}` | String (TTL) | Highest applied Kafka offset per partition (tolerates EOS control/abort gaps) |
+| `einv:delta-batch:{topic}:{partition}` | String JSON (TTL) | Pending leaderboard delta batch with pre-update scores for crash recovery |
 
 Exact invoice dedupe is no longer in Redis. It lives in the Kafka Streams `invoice-dedupe-store` RocksDB state store and its changelog topic.
 
@@ -71,14 +74,11 @@ Company points, rank, and discount are derived from the leaderboard; no duplicat
 - **Recoverable per-partition markers.** The projector stores a per-partition PENDING marker with a TTL, including pre-update scores, so a retry can distinguish “ZINCRBY did not happen” from “it happened before the marker was cleared”.
 - **Minimal DLT.** Invalid event types or missing fields are filtered by the topology into `invoice-events.DLT`; valid records in the same topic are still processed.
 - **Infinite retry in the POC.** A persistent Redis outage blocks the affected partition instead of skipping data. Production should use bounded retries and alerting.
-- **Unbounded exact dedupe.** The RocksDB invoice store has no retention window yet. It is persisted and changelog-backed, but it grows with every unique invoice. A production design needs a documented business retention and a rebuild procedure, or an external ledger once partition-count changes are required.
-- **Optional repartition by company.** The topology re-keys aggregated events to `companyId` without an explicit repartition topic. This keeps the POC topology small, but deltas for one company can originate from several input partitions. The projector still coalesces per batch and delta IDs are unique.
-- **Redis AOF persistence.** Compose enables AOF with `appendfsync everysec` and a named volume. This is not HA and not a substitute for backups.
-- **Consistent competition ranks.** `ZREVRANGE WITHSCORES` returns sorted scores, and top-N ranks are calculated from adjacent equal scores. The company-rank endpoint uses `1 + ZCOUNT key (score +inf`, so equal scores share a rank. `ZREVRANK` is O(log N) but returns an ordinal position for ties, so it is not used for the public rank semantics.
-- **Twelve partitions, six Streams threads and twelve projector listeners.** Partitions bound Streams parallelism; six threads keep two partitions per thread while the projector uses one listener per delta partition. Twelve Streams threads did not improve the local benchmark and raised p95.
-- **500 ms commit interval.** Streams commits offsets, state and output every 500 ms instead of the 100 ms default. This reduced transaction overhead and improved the 1M-event runs while keeping freshness within roughly one second.
-- **Bloom negative cache for invoice dedupe.** Each Streams task keeps an in-heap Bloom filter of its invoice store. First-seen invoices skip the RocksDB read; a filter hit still checks the store, so false positives never drop a valid invoice. The filter is rebuilt by scanning the store on startup and costs about 8 MB per task at 4M expected keys.
-- **Kafka 4.4.0 broker.** Kafka 4.1.0 brokers can crash the transaction coordinator with a negative histogram value (KAFKA-19888), which shut down the Streams client in testing. Broker 4.4.0 matches the client jars and the tested runs completed without that failure.
+- **Bounded exact dedupe with 2-generation Bloom cache & conflict quarantine.** `DedupeProcessor` uses a bounded-retention RocksDB `WindowStore` (`24h` default) so old segments drop in O(1) disk unlink instead of growing forever, plus a 2-generation rotating primitive Bloom filter that avoids bit saturation and skips >99.999% of RocksDB reads. Same `invoiceId` with a different `companyId` is quarantined to `invoice-events.DLT` with header `x-dlt-reason=INVOICE_COMPANY_CONFLICT`.
+- **In-memory window index + deterministic `deltaId`.** `WindowAggregatorProcessor` tracks active 500 ms windows in a `TreeMap` synchronized with RocksDB (eliminating `store.all()` full scans and per-event `store.get()` calls) and emits sequence-numbered deterministic `deltaId`s (`partition:windowStart:companyId:seq`).
+- **Tuned RocksDB off-heap cache & compression.** `HighThroughputRocksDBConfig` configures a shared 256 MB `LRUCache`, 16 KB blocks, native SST Bloom filters, and `LZ4` compression (`31 MB` on disk for 3.61M keys).
+- **Admission control & observability.** `InvoiceEventPublisher` enforces a bounded `Semaphore` (`200,000` in-flight) returning `503 Service Unavailable` + `Retry-After: 1` when saturated, while `RewardMetrics` exposes full pipeline counters/timers at `/actuator/metrics` and `/actuator/prometheus`.
+- **Single-RTT rank/summary & non-blocking Top-N micro-cache.** `rank_and_score.lua` computes `ZSCORE` + `ZCOUNT` in one round trip (powering `/rank` and `/api/companies/{id}/summary`), and `top()` uses a 50 ms single-flight stale-while-revalidate cache.
 
 ## Phase 2 — Complete working implementation
 
@@ -89,6 +89,7 @@ Company points, rank, and discount are derived from the leaderboard; no duplicat
 ├── pom.xml
 ├── docker-compose.yml
 ├── README.md
+├── SYSTEM_DESIGN_AND_DEMO_GUIDE.md
 ├── INTERVIEW.md
 ├── DEEP_RESEARCH_1M_EVENTS_ARCHITECTURE.md
 ├── .gitignore
@@ -106,6 +107,7 @@ Company points, rank, and discount are derived from the leaderboard; no duplicat
     │   │   ├── GamificationApplication.java
     │   │   ├── api/
     │   │   │   ├── ApiErrorResponse.java
+    │   │   │   ├── CompanySummaryResponse.java
     │   │   │   ├── DiscountResponse.java
     │   │   │   ├── InvoiceAcceptedResponse.java
     │   │   │   ├── InvoiceBatchAcceptedResponse.java
@@ -116,6 +118,7 @@ Company points, rank, and discount are derived from the leaderboard; no duplicat
     │   │   │   ├── PointsResponse.java
     │   │   │   └── RankResponse.java
     │   │   ├── config/
+    │   │   │   ├── HighThroughputRocksDBConfig.java
     │   │   │   ├── KafkaConfig.java
     │   │   │   └── RewardStreamsConfig.java
     │   │   ├── event/
@@ -124,7 +127,8 @@ Company points, rank, and discount are derived from the leaderboard; no duplicat
     │   │   ├── exception/
     │   │   │   ├── ApiExceptionHandler.java
     │   │   │   ├── EventPublishException.java
-    │   │   │   └── InvalidInvoiceEventException.java
+    │   │   │   ├── InvalidInvoiceEventException.java
+    │   │   │   └── OverloadException.java
     │   │   ├── invoice/
     │   │   │   ├── InvoiceController.java
     │   │   │   └── InvoiceEventPublisher.java
@@ -135,6 +139,8 @@ Company points, rank, and discount are derived from the leaderboard; no duplicat
     │   │   │   ├── LeaderboardController.java
     │   │   │   ├── LeaderboardProjector.java
     │   │   │   └── LeaderboardService.java
+    │   │   ├── metrics/
+    │   │   │   └── RewardMetrics.java
     │   │   └── streams/
     │   │       ├── DedupeProcessor.java
     │   │       ├── RewardTopology.java
@@ -142,8 +148,10 @@ Company points, rank, and discount are derived from the leaderboard; no duplicat
     │   └── resources/
     │       ├── application.yml
     │       └── scripts/
-    │           └── apply_delta_batch.lua
+    │           ├── apply_delta_batch.lua
+    │           └── rank_and_score.lua
     └── test/java/com/vnpt/einvoice/gamification/
+        ├── GamificationEndToEndIntegrationTest.java
         ├── exception/ApiExceptionHandlerTest.java
         ├── invoice/InvoiceEventPublisherTest.java
         ├── leaderboard/
@@ -158,21 +166,23 @@ Company points, rank, and discount are derived from the leaderboard; no duplicat
 
 | Concern | File |
 |---|---|
-| Producer settings and typed `KafkaTemplate` | `src/main/resources/application.yml`, `src/main/java/com/vnpt/einvoice/gamification/config/KafkaConfig.java` |
-| Single and batch asynchronous publishing | `src/main/java/com/vnpt/einvoice/gamification/invoice/InvoiceEventPublisher.java` |
-| Streams runtime and exactly-once config | `src/main/java/com/vnpt/einvoice/gamification/config/RewardStreamsConfig.java` |
-| Topology, DLT filter, dedupe and window aggregation | `src/main/java/com/vnpt/einvoice/gamification/streams/RewardTopology.java`, `DedupeProcessor.java`, `WindowAggregatorProcessor.java` |
-| Leaderboard delta projector | `src/main/java/com/vnpt/einvoice/gamification/leaderboard/LeaderboardProjector.java`, `src/main/resources/scripts/apply_delta_batch.lua` |
-| Leaderboard, points, rank | `src/main/java/com/vnpt/einvoice/gamification/leaderboard/LeaderboardService.java` |
+| Producer settings, topics and typed `KafkaTemplate` | `src/main/resources/application.yml`, `src/main/java/com/vnpt/einvoice/gamification/config/KafkaConfig.java` |
+| Single/batch async publishing + backpressure | `src/main/java/com/vnpt/einvoice/gamification/invoice/InvoiceEventPublisher.java` |
+| Streams runtime, EOS_v2 and RocksDB tuning | `src/main/java/com/vnpt/einvoice/gamification/config/RewardStreamsConfig.java`, `HighThroughputRocksDBConfig.java` |
+| Topology, DLT, rotating Bloom + WindowStore dedupe, window index | `src/main/java/com/vnpt/einvoice/gamification/streams/RewardTopology.java`, `DedupeProcessor.java`, `WindowAggregatorProcessor.java` |
+| Leaderboard delta projector + Lua | `src/main/java/com/vnpt/einvoice/gamification/leaderboard/LeaderboardProjector.java`, `LeaderboardApplyService.java`, `src/main/resources/scripts/apply_delta_batch.lua` |
+| Leaderboard, single-RTT rank, summary, micro-cache | `src/main/java/com/vnpt/einvoice/gamification/leaderboard/LeaderboardService.java`, `src/main/resources/scripts/rank_and_score.lua` |
 | Discount tiers | `src/main/java/com/vnpt/einvoice/gamification/leaderboard/DiscountService.java` |
-| REST validation and errors | `src/main/java/com/vnpt/einvoice/gamification/exception/ApiExceptionHandler.java` |
-| Streams and Redis tests | `src/test/java/com/vnpt/einvoice/gamification/streams/RewardTopologyTest.java`, `src/test/java/com/vnpt/einvoice/gamification/leaderboard/LeaderboardApplyServiceIntegrationTest.java` |
+| Pipeline observability metrics | `src/main/java/com/vnpt/einvoice/gamification/metrics/RewardMetrics.java` |
+| REST validation and overload/error responses | `src/main/java/com/vnpt/einvoice/gamification/exception/ApiExceptionHandler.java`, `OverloadException.java` |
+| Full E2E, Streams and Redis integration tests | `src/test/java/com/vnpt/einvoice/gamification/GamificationEndToEndIntegrationTest.java`, `RewardTopologyTest.java`, `LeaderboardApplyServiceIntegrationTest.java` |
 
-### Stage 2B Lua script
+### Lua scripts
 
-- `src/main/resources/scripts/apply_delta_batch.lua`: delta dedupe, company coalescing, leaderboard update and recovery.
+- `src/main/resources/scripts/apply_delta_batch.lua`: partition offset checkpointing, daily-bucketed TTL delta Sets, company coalescing, leaderboard update, and `PENDING` crash recovery.
+- `src/main/resources/scripts/rank_and_score.lua`: single-RTT atomic `ZSCORE` + `ZCOUNT` for competition rank and `/summary`.
 
-The script is executed with `EVALSHA` and uses one atomic execution per Kafka batch. Invoice dedupe is owned by the Streams state store, not by Redis.
+Both scripts execute via `EVALSHA`. Invoice dedupe is owned by the Kafka Streams RocksDB `WindowStore`, not by Redis.
 
 ## Phase 3 — Local testing
 
@@ -367,7 +377,11 @@ export JAVA_HOME=$(/usr/libexec/java_home -v 25)
 mvn test
 ```
 
-Expected: **23 JUnit 5 tests**, 0 failures, 0 errors. Testcontainers covers delta Lua dedupe/aggregation/recovery against real Redis. `TopologyTestDriver` covers invoice dedupe, 500 ms window aggregation, the DLT filter and the delta output contract. The projector test covers batch handoff and invalid-delta skipping.
+Expected: **36 automated tests** (`mvn test`), 0 failures, 0 errors:
+- `GamificationEndToEndIntegrationTest` (Testcontainers real Kafka 4.4.0 + Redis 7.4 + full Spring Boot HTTP server): REST single/batch, competition ranking, discount tiers, duplicate replay, company conflict quarantine to DLT, poison-pill resilience, and live Micrometer metrics.
+- `LeaderboardApplyServiceIntegrationTest` (Testcontainers Redis 7.4): bucketed TTL Sets, offset checkpoint gap tolerance, `PENDING` crash recovery & partial mismatch rejection, and atomic 1-RTT `rank_and_score.lua`.
+- `RewardTopologyTest`: dedupe, DLT routing, conflict quarantine, late-event sequential deterministic `deltaId`, and retention TTL expiry.
+- Unit tests covering `LeaderboardProjector` multi-partition grouping, `LeaderboardService` micro-cache, `InvoiceEventPublisher` backpressure, `DiscountService`, and `ApiExceptionHandler`.
 
 ### 11. Run the performance benchmark
 
@@ -420,45 +434,44 @@ Environment: macOS arm64, Docker Desktop 29.7.2, Temurin Java 25.0.3, local sing
 
 A 100,000-event run is dominated by the fixed 500 ms window and projection drain, so the gate is measured with 1,000,000 unique events per run. Each run starts with an empty Redis and produces 10,000,000 expected points.
 
-| Metric | Target | Optimized Stage 2B |
+| Metric | Target | Optimized Pipeline (Current `HEAD`) |
 |---|---:|---:|
-| Producer-acked unique events/s | — | 116,708.38–135,115.94 |
-| End-to-end unique events/s (1M per run) | 100,000 | **102,541.84 / 120,862.70 / 122,030.32** |
-| Leaderboard p95 | about 5 ms | 1.28–3.00 ms post-drain |
-| Correct points | 10,000,000 | passed on all 3 runs |
-| Duplicate replay | no extra points | passed; duplicate batch replay produced no delta |
-| Restart dedupe | no extra points | passed; 3M-key store restored in 42 s, replay produced no delta, a fresh invoice still awarded 10 points |
-| JUnit 5 | — | 23/23 passed |
+| Direct Kafka 1M end-to-end events/s (3 runs) | 100,000 | **99,746.53 / 138,627.96 / 98,800.41** |
+| Pipeline backlog drain rate | — | **175,548.56 – 201,675.94 events/s** |
+| REST batch (500k events, 1,000/req) | — | **142,788.10 accepted/s**, **96,606.04 E2E/s**, **1.05 ms p95** |
+| Leaderboard p95 (post-drain) | ~5 ms | **0.27 – 0.62 ms** (Direct) / **1.05 ms** (REST batch) |
+| Leaderboard p95/p99 under concurrent write load | — | **13.55 – 17.19 ms p95** / **30.18 – 37.59 ms p99** (5.6k–7.0k read samples) |
+| Bloom filter negative-cache accuracy (3.61M keys) | — | **3,609,996 skips / 4 false positives (99.9999%)** |
+| Redis write compression (3.61M events) | — | **64,037 deltas → 1,968 Lua batches (1,834:1)** |
+| RocksDB footprint (3.61M keys, LZ4) | — | **31 MB on disk** |
+| Graceful restart & state restore (3.61M keys) | — | **33.97 s** total (`REBALANCING → RUNNING`); replay & conflict added **0 pts**, fresh invoice awarded **10 pts** |
+| Automated JUnit + Testcontainers E2E | — | **36/36 passed** |
 
-All three optimized runs exceeded 100k unique events/s end-to-end. During the producer phase the Streams topology trailed by 100k–161k events and then drained at 125k–187k events/s, so the measured result is limited by concurrent producer/host contention rather than a hard pipeline ceiling. An earlier backlog-only run with Kafka 4.1.0 and the 100 ms commit interval processed and applied 1M queued events at about 167k events/s.
+Across the three final 1M-event direct Kafka runs (concurrent with 8 HTTP leaderboard reader threads on the same Apple M4 host), end-to-end throughput measured `99,746.53`, `138,627.96`, and `98,800.41` events/s with pipeline backlog drain rates of `175k–201k` events/s, while a 500,000-event REST batch run measured `142,788.10` accepted events/s and `96,606.04` E2E events/s. Post-drain leaderboard p95 stayed at `0.27–1.05 ms` and under-load concurrent read p95 improved to `13.55–17.19 ms`.
 
-Tuning history on the same code path: Kafka 4.1.0 broker crashed the Streams client with KAFKA-19888; Kafka 4.4.0 fixed it. A 100 ms Streams commit interval measured 102,734.92 / 122,299.60 / 119,156.55 events/s; 500 ms measured 126,016.29 / 126,000.46 / 116,491.17 events/s and was kept. Twelve Streams threads measured 103,507.25 / 120,175.13 events/s and was rejected. The dedupe Bloom cache was kept because it removes a RocksDB read per first-seen invoice; its effect is largest when the store has millions of keys.
+Tuning history on the same architecture: Kafka 4.1.0 broker crashed the Streams client with KAFKA-19888; Kafka 4.4.0 fixed it. Raising commit interval from 100 ms to 500 ms reduced transaction overhead while keeping freshness under 1 s; adding a cross-DB RocksDB `WriteBufferManager` caused tiny SST flush stalls (~83 events/s) and was removed in favor of a shared 256 MB `LRUCache` + per-store memtables + `LZ4` compression; adding `O(ready)` `TreeMap` window indexing, single-flight Top-N micro-caching, and batch-level permit release lifted drain throughput to >200k/s and REST batch acceptance to 142k–195k/s.
 
-The p95 is a post-drain sequential read, not measured under concurrent leaderboard load. The 15-minute sustained gate and 1,000 reads/s latency gate from the roadmap are **not** proven by these short runs; what is proven is that three independent 1M-event runs crossed 100k/s with exact point totals and no duplicate effects.
+The 15-minute sustained gate and dedicated multi-node 10,000 reads/s cluster test from the roadmap are **not** proven by these single-host Docker runs; what is proven is sustained ~100k–138k/s E2E bursts, ~200k/s pipeline drain, exact point totals, conflict/DLT routing, and clean restart state recovery.
 
 Full machine-readable output: `docs/benchmark-results.json`.
 
 ### Remaining bottlenecks and next scaling steps
 
-- The dedupe store has no retention window. At 1M/s a day of invoice IDs is 86.4 billion keys; the store needs a documented business TTL or an external ledger before claiming that scale. The local 3M-key store used about 70 MB on disk.
-- Each Streams task keeps an 8 MB Bloom filter and rebuilds it by scanning the store on startup; restore time grows with state size (42 s for 3M keys locally).
-- `selectKey(companyId)` does not insert a repartition topic in this POC, so one company's deltas can be spread across input partitions. A production projector should consume a company-keyed topic.
-- The aggregator scans its RocksDB window store every 250 ms and emits from wall-clock punctuation. Late events are still counted, but they can be emitted after their nominal window.
-- Kafka EOS covers offsets, state and delta output only. Redis application is idempotent but not transactional; the delta Set grows with every delta and only pending markers have a TTL.
-- The local producer, application, Redis and unrelated containers share CPU. Twelve partitions and six Streams threads are a Stage 2 POC choice, not a 1M/s design. A 15-minute sustained run, concurrent-read p95, freshness and failover drills remain open.
-
-Stage 3 scaling steps — larger partition counts, partitioned exact state with expiry, repartition/coalescing, dedicated leaderboard infrastructure and a 1M/s capacity run — are in `DEEP_RESEARCH_1M_EVENTS_ARCHITECTURE.md` and `docs/roadmap/1m-events-roadmap.md`.
+- Exact invoice dedupe lives in partition-local RocksDB `WindowStore` (bounded by `app.dedupe.retention-ms`, default 24 h). Changing `invoice-events` partition counts during an active retention window still requires state migration or switching to an external stable ledger (`ScyllaDB`/`Cassandra` LWT).
+- `company-reward-deltas` is keyed by `companyId` (map-side pre-aggregated per task per 500 ms window) to avoid doubling Kafka I/O with a raw-event repartition topic; if active company cardinality exceeds tens of thousands per window, tune `window.size-ms` and partition counts together.
+- On a single Docker host, producer, Spring Boot, Kafka broker, and Redis share CPU. Stage 3 scaling — 64–128 partitions across multi-broker RF3 Kafka, external LWT ledger, dedicated Redis HA, chaos failover drills, and a 30-minute 1M/s run — is detailed in `DEEP_RESEARCH_1M_EVENTS_ARCHITECTURE.md` and `docs/roadmap/1m-events-roadmap.md`.
 
 ## Validation and error behavior
 
 - Blank or oversized request fields and empty/oversized batches return `400`.
 - Malformed JSON, a non-numeric `limit`, and `limit` outside 1–100 return `400`.
 - A non-JSON content type returns `415`.
-- The API queues Kafka publishing asynchronously and returns `202` with status `PUBLISHING`; asynchronous delivery failures are logged, so clients retry with the same `invoiceId` when needed.
+- Saturated ingestion (`max-in-flight` exceeded) or Kafka producer rejection returns `503` (`Retry-After: 1` on overload).
+- The API queues Kafka publishing asynchronously and returns `202` with status `PUBLISHING`; asynchronous delivery failures are logged and counted via Micrometer, so clients retry with the same `invoiceId` when needed.
 - Redis read failure returns `503`.
 - Projector Redis failure is not committed. The POC retries the full batch every second until processing succeeds.
 - The projector consumes with `isolation.level=read_committed`, so aborted Streams transactions are not applied.
-- Invalid event types or missing fields are routed by the topology to `invoice-events.DLT`; Kafka deserialization failures still require operations follow-up.
+- Invalid event types, missing fields, and `INVOICE_COMPANY_CONFLICT` duplicates are routed by the topology to `invoice-events.DLT`; malformed JSON poison pills are logged and skipped via `LogAndContinueExceptionHandler` so the pipeline never stalls.
 
 ## Shutdown
 

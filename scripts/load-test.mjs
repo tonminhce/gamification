@@ -3,6 +3,7 @@ import { performance } from "node:perf_hooks";
 import { setTimeout as delay } from "node:timers/promises";
 
 const baseUrl = process.env.BASE_URL ?? "http://localhost:8080";
+const kafkaBootstrap = process.env.KAFKA_BOOTSTRAP ?? "localhost:9092";
 const total = Number(process.env.TOTAL ?? 10_000);
 const concurrency = Number(process.env.CONCURRENCY ?? 100);
 const companyCount = Number(process.env.COMPANIES ?? 20);
@@ -68,7 +69,7 @@ function kafkaLag() {
   const output = execFileSync("docker", [
     "compose", "exec", "-T", "kafka",
     "/opt/kafka/bin/kafka-consumer-groups.sh",
-    "--bootstrap-server", "localhost:9092",
+    "--bootstrap-server", kafkaBootstrap,
     "--describe", "--group", "einvoice-gamification",
   ], { encoding: "utf8" });
 

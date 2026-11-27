@@ -5,12 +5,15 @@ server:
 spring:
   application:
     name: einvoice-gamification-poc
+  threads:
+    virtual:
+      enabled: true
 
   kafka:
     bootstrap-servers: ${KAFKA_BOOTSTRAP_SERVERS:localhost:9092}
     producer:
       key-serializer: org.apache.kafka.common.serialization.StringSerializer
-      value-serializer: org.springframework.kafka.support.serializer.JsonSerializer
+      value-serializer: org.springframework.kafka.support.serializer.JacksonJsonSerializer
       acks: all
       retries: 10
       batch-size: 65536
@@ -22,6 +25,8 @@ spring:
         max.in.flight.requests.per.connection: 5
         delivery.timeout.ms: 10000
         request.timeout.ms: 5000
+        max.block.ms: 2000
+        spring.json.add.type.headers: false
     consumer:
       group-id: einvoice-gamification
       key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
@@ -30,12 +35,14 @@ spring:
       auto-offset-reset: earliest
       max-poll-records: 5000
       properties:
-        spring.deserializer.value.delegate.class: org.springframework.kafka.support.serializer.JsonDeserializer
+        spring.deserializer.value.delegate.class: org.springframework.kafka.support.serializer.JacksonJsonDeserializer
+        spring.json.use.type.headers: false
+        spring.json.value.default.type: com.vnpt.einvoice.gamification.event.CompanyRewardDelta
         spring.json.trusted.packages: com.vnpt.einvoice.gamification.event
         isolation.level: read_committed
         max.poll.interval.ms: 300000
-        fetch.min.bytes: 1048576
-        fetch.max.wait.ms: 100
+        fetch.min.bytes: 65536
+        fetch.max.wait.ms: 50
     listener:
       ack-mode: BATCH
       concurrency: 12
@@ -47,19 +54,40 @@ spring:
       timeout: 2s
       connect-timeout: 2s
 
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics,prometheus
+  endpoint:
+    health:
+      show-details: always
+
 app:
   kafka:
     topic: invoice-events
     delta-topic: company-reward-deltas
     dlt-topic: invoice-events.DLT
+    partitions: 12
   streams:
     application-id: einvoice-reward-streams
     threads: 6
     commit-interval-ms: 500
-    state-dir: /tmp/einvoice-reward-streams
+    state-dir: ${STREAMS_STATE_DIR:./data/einvoice-reward-streams}
+    rocksdb-block-cache-mb: 256
+    rocksdb-write-buffer-mb: 128
+  dedupe:
+    retention-ms: 86400000
+    bloom-expected-insertions: 4000000
+  window:
+    size-ms: 500
+    punctuation-ms: 100
+  ingest:
+    max-in-flight: 200000
   leaderboard:
     key: einv:leaderboard
     processed-delta-set: "einv:processed-deltas"
+    top-cache-ttl-ms: 50
   reward:
     batch-marker-ttl-seconds: 604800
 

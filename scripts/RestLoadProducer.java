@@ -1,7 +1,5 @@
-import com.fasterxml.jackson.databind.JsonNode;
-import com.fasterxml.jackson.databind.ObjectMapper;
-import com.fasterxml.jackson.databind.json.JsonMapper;
-import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule;
+import tools.jackson.databind.JsonNode;
+import tools.jackson.databind.json.JsonMapper;
 
 import java.net.URI;
 import java.net.http.HttpClient;
@@ -23,43 +21,72 @@ public class RestLoadProducer {
         int concurrency = args.length > 1 ? Integer.parseInt(args[1]) : 200;
         int companies = args.length > 2 ? Integer.parseInt(args[2]) : 20;
         String api = args.length > 3 ? args[3] : "http://localhost:8080";
+        int batchSize = args.length > 4 ? Integer.parseInt(args[4]) : 1;
         String runId = "REST-" + System.currentTimeMillis();
 
-        ObjectMapper mapper = JsonMapper.builder()
-                .addModule(new JavaTimeModule())
-                .build();
+        JsonMapper mapper = JsonMapper.builder().build();
         HttpClient client = HttpClient.newBuilder()
                 .version(HttpClient.Version.HTTP_1_1)
                 .build();
 
-        List<byte[]> bodies = new ArrayList<>(total);
-        for (int i = 0; i < total; i++) {
-            String invoiceId = runId + "-" + i;
-            String companyId = runId + "-COMPANY-" + (i % companies);
-            bodies.add(mapper.writeValueAsBytes(Map.of(
-                    "invoiceId", invoiceId,
-                    "companyId", companyId
-            )));
+        long baselinePoints = totalPoints(client, mapper, api);
+        String endpoint = batchSize > 1 ? "/api/invoices/batch" : "/api/invoices/simulate";
+
+        List<byte[]> bodies = new ArrayList<>();
+        if (batchSize <= 1) {
+            for (int i = 0; i < total; i++) {
+                String invoiceId = runId + "-" + i;
+                String companyId = runId + "-COMPANY-" + (i % companies);
+                bodies.add(mapper.writeValueAsBytes(Map.of(
+                        "invoiceId", invoiceId,
+                        "companyId", companyId
+                )));
+            }
+        } else {
+            for (int startIdx = 0; startIdx < total; startIdx += batchSize) {
+                int endIdx = Math.min(total, startIdx + batchSize);
+                List<Map<String, String>> invoices = new ArrayList<>(endIdx - startIdx);
+                for (int i = startIdx; i < endIdx; i++) {
+                    invoices.add(Map.of(
+                            "invoiceId", runId + "-" + i,
+                            "companyId", runId + "-COMPANY-" + (i % companies)
+                    ));
+                }
+                bodies.add(mapper.writeValueAsBytes(Map.of("invoices", invoices)));
+            }
         }
 
+        int requestCount = bodies.size();
         AtomicInteger nextIndex = new AtomicInteger();
+        AtomicInteger overload503Responses = new AtomicInteger();
         long start = System.nanoTime();
         try (ExecutorService executor = Executors.newVirtualThreadPerTaskExecutor()) {
-            List<Future<Void>> futures = new ArrayList<>(concurrency);
-            for (int worker = 0; worker < concurrency; worker++) {
+            List<Future<Void>> futures = new ArrayList<>(Math.min(concurrency, requestCount));
+            for (int worker = 0; worker < Math.min(concurrency, requestCount); worker++) {
                 futures.add(executor.submit(() -> {
                     while (true) {
                         int index = nextIndex.getAndIncrement();
-                        if (index >= total) {
+                        if (index >= requestCount) {
                             return null;
                         }
-                        HttpRequest request = HttpRequest.newBuilder(URI.create(api + "/api/invoices/simulate"))
-                                .timeout(Duration.ofSeconds(10))
-                                .header("content-type", "application/json")
-                                .POST(HttpRequest.BodyPublishers.ofByteArray(bodies.get(index)))
-                                .build();
-                        HttpResponse<Void> response = client.send(request, HttpResponse.BodyHandlers.discarding());
-                        if (response.statusCode() != 202) {
+                        byte[] payload = bodies.get(index);
+                        int attempts = 0;
+                        while (true) {
+                            HttpRequest request = HttpRequest.newBuilder(URI.create(api + endpoint))
+                                    .timeout(Duration.ofSeconds(10))
+                                    .header("content-type", "application/json")
+                                    .POST(HttpRequest.BodyPublishers.ofByteArray(payload))
+                                    .build();
+                            HttpResponse<Void> response = client.send(request, HttpResponse.BodyHandlers.discarding());
+                            if (response.statusCode() == 202) {
+                                break;
+                            }
+                            if (response.statusCode() == 503 && attempts < 20) {
+                                overload503Responses.incrementAndGet();
+                                attempts++;
+                                Thread.sleep(50L + (attempts * 25L));
+                                continue;
+                            }
                             throw new IllegalStateException("Expected 202, received " + response.statusCode());
                         }
                     }
@@ -71,19 +98,19 @@ public class RestLoadProducer {
         }
         long publishEnd = System.nanoTime();
 
-        long expectedPoints = total * 10L;
-        long deadline = System.nanoTime() + Duration.ofSeconds(60).toNanos();
+        long expectedTotal = baselinePoints + total * 10L;
+        long deadline = System.nanoTime() + Duration.ofSeconds(90).toNanos();
         long observedPoints;
         while (true) {
             observedPoints = totalPoints(client, mapper, api);
-            if (observedPoints >= expectedPoints || System.nanoTime() >= deadline) {
+            if (observedPoints >= expectedTotal || System.nanoTime() >= deadline) {
                 break;
             }
             Thread.sleep(25);
         }
         long end = System.nanoTime();
-        if (observedPoints != expectedPoints) {
-            throw new IllegalStateException("Expected " + expectedPoints + " points, observed " + observedPoints);
+        if (observedPoints != expectedTotal) {
+            throw new IllegalStateException("Expected " + expectedTotal + " points, observed " + observedPoints);
         }
 
         for (int i = 0; i < 20; i++) {
@@ -104,17 +131,19 @@ public class RestLoadProducer {
         System.out.println(mapper.writerWithDefaultPrettyPrinter().writeValueAsString(new Result(
                 runId,
                 total,
+                batchSize,
                 concurrency,
                 companies,
                 round(total / publishSeconds),
                 round(total / endToEndSeconds),
                 round(p95),
-                expectedPoints,
-                observedPoints
+                overload503Responses.get(),
+                total * 10L,
+                observedPoints - baselinePoints
         )));
     }
 
-    private static long totalPoints(HttpClient client, ObjectMapper mapper, String api) throws Exception {
+    private static long totalPoints(HttpClient client, JsonMapper mapper, String api) throws Exception {
         JsonNode body = mapper.readTree(leaderboardRequest(client, api));
         long points = 0;
         for (JsonNode entry : body.path("entries")) {
@@ -142,13 +171,15 @@ public class RestLoadProducer {
     private record Result(
             String runId,
             int total,
+            int batchSize,
             int concurrency,
             int companies,
             double apiAcceptedEventsPerSecond,
             double restEndToEndEventsPerSecond,
             double leaderboardP95Ms,
-            long expectedPoints,
-            long observedPoints
+            int overload503Responses,
+            long expectedAddedPoints,
+            long observedAddedPoints
     ) {
     }
 }

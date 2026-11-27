@@ -63,6 +63,18 @@ public class ApiExceptionHandler {
         return error(HttpStatus.NOT_FOUND, "Resource not found");
     }
 
+    @ExceptionHandler(OverloadException.class)
+    ResponseEntity<ApiErrorResponse> handleOverload(OverloadException ex) {
+        return ResponseEntity.status(HttpStatus.SERVICE_UNAVAILABLE)
+                .header("Retry-After", "1")
+                .body(new ApiErrorResponse(
+                        Instant.now(),
+                        HttpStatus.SERVICE_UNAVAILABLE.value(),
+                        HttpStatus.SERVICE_UNAVAILABLE.getReasonPhrase(),
+                        ex.getMessage()
+                ));
+    }
+
     @ExceptionHandler(EventPublishException.class)
     ResponseEntity<ApiErrorResponse> handlePublishFailure(EventPublishException ex) {
         return error(HttpStatus.SERVICE_UNAVAILABLE, ex.getMessage());
