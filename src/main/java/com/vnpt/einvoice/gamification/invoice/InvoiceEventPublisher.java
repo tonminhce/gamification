@@ -44,7 +44,7 @@ public class InvoiceEventPublisher {
         );
 
         try {
-            kafkaTemplate.send(topic, request.companyId(), event).whenComplete((result, ex) -> {
+            kafkaTemplate.send(topic, request.invoiceId(), event).whenComplete((result, ex) -> {
                 if (ex != null) {
                     log.error("Asynchronous Kafka publish failed for invoiceId={}", request.invoiceId(), ex);
                 }

@@ -9,7 +9,25 @@
 
 POC hiện tại đã chứng minh đường Java 25/Spring Boot 4 → Kafka → Redis Lua → Sorted Set hoạt động đúng và đạt khoảng 11,5k unique events/s end-to-end với leaderboard p95 2,89 ms trên máy local. Mục tiêu mới là 1 triệu events/s cho toàn bộ REST → Kafka → Redis, leaderboard p95 khoảng 5 ms, idempotency chính xác theo business window và cho phép scale-out.
 
-Kiến trúc “mỗi invoice → một Lua script → một Redis marker” chưa được chứng minh là phù hợp ở 1M/s. Stage 1 đã thay bằng batch API, 12 partitions và một Lua batch script dùng Redis Set. Stage 2A đã thêm reward-delta topic và leaderboard projector; partitioned exact state store/time-window aggregation vẫn là Stage 2B. Ở tốc độ đó, mỗi event vẫn cần exact lookup, marker state và thao tác cập nhật. Retention 24 giờ tạo ra 86,4 tỷ invoice IDs, còn Redis command execution vẫn tuần tự. Vì vậy cần thay đổi đơn vị xử lý, không chỉ tăng batch.
+Kiến trúc “mỗi invoice → một Lua script → một Redis marker” chưa được chứng minh là phù hợp ở 1M/s. Stage 1 đã thay bằng batch API, 12 partitions và một Lua batch script dùng Redis Set. Stage 2A đã thêm reward-delta topic và leaderboard projector. Stage 2B đã thay Redis claim bằng Kafka Streams `exactly_once_v2`, RocksDB dedupe store có changelog và time-window aggregation 500 ms trước delta topic. Ở tốc độ 1M/s, mỗi event vẫn cần exact lookup và thao tác cập nhật, retention 24 giờ tạo ra 86,4 tỷ invoice IDs, còn Redis command execution vẫn tuần tự. Vì vậy cần thay đổi đơn vị xử lý và partition/coalesce, không chỉ tăng batch.
+
+### Trạng thái triển khai Stage 2B (2026-11-27)
+
+Đã có trong POC:
+
+- Hai hop `invoice-events → company-reward-deltas → Redis`, Streams `exactly_once_v2`.
+- Dedupe `invoiceId` trong persistent RocksDB store + changelog; đã kiểm chứng replay sau restart không tạo delta mới.
+- Window aggregation 500 ms, delta output có `deltaId`, `deltaPoints`, `windowStart`, `windowEnd`, `schemaVersion`.
+- Projector `isolation.level=read_committed`, batch Lua với delta Set, PENDING marker và TTL.
+- 23 JUnit 5 test pass; bốn run 100k event đều ra đúng 1.000.000 điểm; best 60.311,12 events/s end-to-end, p95 1,07–2,45 ms post-drain.
+
+Chưa đạt hoặc chưa làm so với ADR:
+
+- Chưa lên 64 partitions/RF3; POC dùng 12 partitions, RF1.
+- `selectKey(companyId)` chưa tạo repartition topic, nên delta của một company có thể nằm nhiều partition.
+- `deltaId` chứa UUID, chưa deterministic theo window/company.
+- Dedupe store chưa có retention/TTL, chưa có rebuild drill hay chaos test.
+- Chưa đạt 100k/s ổn định, càng chưa có capacity run 300k/s hay 1M/s.
 
 ## Decision
 

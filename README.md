@@ -1,20 +1,20 @@
-# VNPT e-Invoice Gamification POC — Stage 2A
+# VNPT e-Invoice Gamification POC — Stage 2B
 
-A single Spring Boot application that simulates invoice issuance, publishes `INVOICE_ISSUED` events to Kafka, awards points idempotently through Redis Lua, and exposes a real-time company leaderboard.
+A single Spring Boot application that simulates invoice issuance, publishes `INVOICE_ISSUED` events to Kafka, deduplicates and aggregates them in a Kafka Streams topology, and applies idempotent reward deltas to a Redis leaderboard through Lua.
 
-Stack: Java 25, Spring Boot 4.2.0, Spring Kafka 4.2.0, Kafka 4.1.0, Redis 7.4, Maven, Docker Compose, JUnit 5.14.4.
+Stack: Java 25, Spring Boot 4.2.0, Spring Kafka 4.2.0, Kafka 4.1.0, Kafka Streams 4.4.0, Redis 7.4, Maven, Docker Compose, JUnit 5.14.4.
 
 ## Phase 1 — Simple system design
 
 ```mermaid
 flowchart LR
     C[Client / curl] -->|single hoặc batch| API[Spring Boot REST API]
-    API -->|KafkaTemplate.send| KP[Kafka Producer]
+    API -->|KafkaTemplate.send, key = invoiceId| KP[Kafka Producer]
     KP -->|acks=all| KT[(Kafka: invoice-events, 12 partitions)]
-    KT -->|consumer group: einvoice-gamification| KC[Invoice reward processor]
-    KC -->|claim + aggregate| CA[Redis claim Lua]
-    KC -->|publish per-company delta| KD[(Kafka: company-reward-deltas)]
-    KD --> LP[Leaderboard projector]
+    KT -->|Kafka Streams, EOS_v2, 6 threads| DS[Dedupe processor<br/>RocksDB invoice store]
+    DS -->|dedupes invoiceId| WA[Window aggregator<br/>500 ms, RocksDB]
+    WA -->|one delta per company per window| KD[(Kafka: company-reward-deltas)]
+    KD -->|batch listener, read_committed| LP[Leaderboard projector]
     LP -->|idempotent delta batch| DL[Redis delta Lua]
     DL -->|ZINCRBY per company| ZS[(Redis Sorted Set: leaderboard)]
     API -->|GET endpoints| LS[Leaderboard Service]
@@ -25,13 +25,12 @@ flowchart LR
 ### Event-processing flow
 
 1. `POST /api/invoices/simulate` accepts one invoice; `POST /api/invoices/batch` accepts up to 1,000 invoices.
-2. The producer uses `companyId` as the Kafka key and returns `202 Accepted` with status `PUBLISHING` after queuing the asynchronous send.
-3. Kafka stores events across 12 partitions. A consumer group processes partitions independently.
-4. The consumer validates the whole Kafka batch and creates a deterministic batch ID from topic, partition and offset range.
-5. The invoice processor claims IDs with a recoverable Redis Lua batch, aggregates points per company, publishes one `CompanyRewardDelta` per company to Kafka, then deletes the claim marker.
-6. The leaderboard projector consumes the delta topic, checks/deduplicates delta IDs in Redis, coalesces by company, and applies `ZINCRBY` in one recoverable Lua batch.
-7. Batch offsets commit only after each listener succeeds. Failures redeliver; claim/delta markers and processed Sets make retries idempotent.
-8. Leaderboard endpoints read Redis Sorted Sets directly. Discounts are calculated from current points.
+2. The producer uses `invoiceId` as the Kafka key and returns `202 Accepted` with status `PUBLISHING` after queuing the asynchronous send.
+3. Kafka Streams consumes `invoice-events` across 12 partitions with `exactly_once_v2`. The dedupe processor checks its persistent RocksDB store keyed by `invoiceId`; an existing key is dropped before any aggregation.
+4. New invoices are re-keyed to `companyId` and accumulated in a 500 ms event-time window. A wall-clock punctuator emits one `CompanyRewardDelta` per company per completed window to `company-reward-deltas`.
+5. The leaderboard projector consumes the delta topic with `isolation.level=read_committed`, deduplicates delta IDs in Redis, coalesces by company, and applies `ZINCRBY` in one recoverable Lua batch.
+6. Streams commits input offsets, state-store writes and output records in one Kafka transaction. The projector commits its batch offset only after Redis succeeds; failures redeliver and are absorbed by the delta Set and pending marker.
+7. Leaderboard endpoints read Redis Sorted Sets directly. Discounts are calculated from current points.
 
 ### Kafka event JSON
 
@@ -47,35 +46,36 @@ flowchart LR
 ```
 
 - `eventId` identifies a transport message.
-- `invoiceId` is the business idempotency key. A redelivery with a different `eventId` still cannot award twice.
-- `companyId` is also the Kafka partition key, preserving order for one company.
+- `invoiceId` is the business idempotency key and the Kafka record key. A redelivery with a different `eventId` still cannot award twice.
+- `companyId` is used for window aggregation and delta output. It is intentionally not the input key: dedupe locality follows the invoice identity, so a duplicate invoice always reaches the same Streams task.
 
 ### Redis keys
 
 | Key | Type | Purpose |
 |---|---|---|
 | `einv:leaderboard` | Sorted Set | Member = `companyId`, score = total points |
-| `einv:processed-invoices` | Set | Exact invoice IDs already claimed |
-| `einv:invoice-claim:{topic}:{partition}` | String JSON | Pending invoice claim with TTL |
 | `einv:processed-deltas` | Set | Company reward delta IDs already applied |
 | `einv:delta-batch:{topic}:{partition}` | String JSON | Pending leaderboard delta batch with TTL |
+
+Exact invoice dedupe is no longer in Redis. It lives in the Kafka Streams `invoice-dedupe-store` RocksDB state store and its changelog topic.
 
 Company points, rank, and discount are derived from the leaderboard; no duplicate company profile is stored.
 
 ### Important decisions and trade-offs
 
-- **At-least-once processing, not end-to-end exactly once.** Kafka can redeliver; Redis makes the business effect idempotent. No Kafka transactions or exactly-once claim are used.
+- **Kafka-to-Kafka exactly once, Redis at-least-once with idempotent sink.** Streams uses `exactly_once_v2`, so offsets, RocksDB state and delta output commit together. Redis is outside that transaction; the projector's delta Set and recoverable Lua marker make application idempotent. There is no end-to-end exactly-once claim across Redis.
 - **Asynchronous publish for ingress throughput.** The API returns after queuing the send instead of waiting for the broker. Delivery failures are logged and retries use the same `invoiceId`; production should add an outbox or delivery-status store if accepted requests must be durably retained.
-- **Batch acknowledgment.** Committing every record was measurably expensive. `AckMode.BATCH` commits after the whole listener batch succeeds. If event 50 fails, events 1–49 can be redelivered, but Lua returns duplicate for them.
-- **Two-stage reward pipeline.** Invoice processing no longer writes the leaderboard. It publishes per-company deltas; a separate projector owns Redis Sorted Set updates.
-- **One Lua call per Kafka batch at each stage.** Invoice claims use `SMISMEMBER` and chunked `SADD`; the projector aggregates delta points per company and writes one `ZINCRBY` per company.
-- **Recoverable per-partition markers.** Both stages use stable per-partition marker keys with TTLs. A retry recovers the stored pending batch before processing the current record list.
-- **Minimal DLT.** Invalid event types or missing fields are published to `invoice-events.DLT`; valid records in the same batch are still processed. A failed DLT publish is retried rather than acknowledged.
+- **Batch acknowledgment at the projector.** Streams owns input offsets transactionally. The Spring listener consuming `company-reward-deltas` uses `AckMode.BATCH`, so a projector crash can redeliver a batch; the delta Set absorbs it.
+- **Two-stage reward pipeline.** Streams deduplicates invoices and aggregates 500 ms windows; the projector alone owns Redis Sorted Set updates.
+- **One Lua call per projector batch.** Deltas are deduplicated and coalesced per company inside one atomic script execution, producing one `ZINCRBY` per company per batch.
+- **Recoverable per-partition markers.** The projector stores a per-partition PENDING marker with a TTL, including pre-update scores, so a retry can distinguish “ZINCRBY did not happen” from “it happened before the marker was cleared”.
+- **Minimal DLT.** Invalid event types or missing fields are filtered by the topology into `invoice-events.DLT`; valid records in the same topic are still processed.
 - **Infinite retry in the POC.** A persistent Redis outage blocks the affected partition instead of skipping data. Production should use bounded retries and alerting.
-- **Permanent processed Sets.** Invoice and delta Sets grow with cardinality. Stage 2B should move exact invoice dedupe to a partitioned state store with a business retention window.
+- **Unbounded exact dedupe.** The RocksDB invoice store has no retention window yet. It is persisted and changelog-backed, but it grows with every unique invoice. A production design needs a documented business retention and a rebuild procedure, or an external ledger once partition-count changes are required.
+- **Optional repartition by company.** The topology re-keys aggregated events to `companyId` without an explicit repartition topic. This keeps the POC topology small, but deltas for one company can originate from several input partitions. The projector still coalesces per batch and delta IDs are unique.
 - **Redis AOF persistence.** Compose enables AOF with `appendfsync everysec` and a named volume. This is not HA and not a substitute for backups.
 - **Consistent competition ranks.** `ZREVRANGE WITHSCORES` returns sorted scores, and top-N ranks are calculated from adjacent equal scores. The company-rank endpoint uses `1 + ZCOUNT key (score +inf`, so equal scores share a rank. `ZREVRANK` is O(log N) but returns an ordinal position for ties, so it is not used for the public rank semantics.
-- **Twelve partitions.** This is the Stage 1 topology. Increasing to 24 consumers made the local benchmark worse because of CPU/context-switch overhead.
+- **Twelve partitions, six Streams threads and twelve projector listeners.** Partitions bound Streams parallelism; six threads keep two partitions per thread while the projector uses one listener per delta partition. More threads were not re-tested for Stage 2B.
 
 ## Phase 2 — Complete working implementation
 
@@ -112,8 +112,9 @@ Company points, rank, and discount are derived from the leaderboard; no duplicat
     │   │   │   ├── LeaderboardResponse.java
     │   │   │   ├── PointsResponse.java
     │   │   │   └── RankResponse.java
-    │   │   ├── config/KafkaConfig.java
-    │   │   ├── consumer/InvoiceRewardProcessor.java
+    │   │   ├── config/
+    │   │   │   ├── KafkaConfig.java
+    │   │   │   └── RewardStreamsConfig.java
     │   │   ├── event/
     │   │   │   ├── CompanyRewardDelta.java
     │   │   │   └── InvoiceIssuedEvent.java
@@ -131,17 +132,15 @@ Company points, rank, and discount are derived from the leaderboard; no duplicat
     │   │   │   ├── LeaderboardController.java
     │   │   │   ├── LeaderboardProjector.java
     │   │   │   └── LeaderboardService.java
-    │   │   └── reward/
-    │   │       ├── ClaimedCompanyDelta.java
-    │   │       ├── InvoiceClaimResult.java
-    │   │       └── InvoiceClaimService.java
+    │   │   └── streams/
+    │   │       ├── DedupeProcessor.java
+    │   │       ├── RewardTopology.java
+    │   │       └── WindowAggregatorProcessor.java
     │   └── resources/
     │       ├── application.yml
     │       └── scripts/
-    │           ├── apply_delta_batch.lua
-    │           └── claim_invoice_batch.lua
+    │           └── apply_delta_batch.lua
     └── test/java/com/vnpt/einvoice/gamification/
-        ├── consumer/InvoiceRewardProcessorTest.java
         ├── exception/ApiExceptionHandlerTest.java
         ├── invoice/InvoiceEventPublisherTest.java
         ├── leaderboard/
@@ -149,7 +148,7 @@ Company points, rank, and discount are derived from the leaderboard; no duplicat
         │   ├── LeaderboardApplyServiceIntegrationTest.java
         │   ├── LeaderboardProjectorTest.java
         │   └── LeaderboardServiceTest.java
-        └── reward/InvoiceClaimServiceIntegrationTest.java
+        └── streams/RewardTopologyTest.java
 ```
 
 ### Core implementation map
@@ -158,20 +157,19 @@ Company points, rank, and discount are derived from the leaderboard; no duplicat
 |---|---|
 | Producer settings and typed `KafkaTemplate` | `src/main/resources/application.yml`, `src/main/java/com/vnpt/einvoice/gamification/config/KafkaConfig.java` |
 | Single and batch asynchronous publishing | `src/main/java/com/vnpt/einvoice/gamification/invoice/InvoiceEventPublisher.java` |
-| Invoice claim and DLT | `src/main/java/com/vnpt/einvoice/gamification/consumer/InvoiceRewardProcessor.java` |
-| Exact invoice claim/aggregation | `src/main/resources/scripts/claim_invoice_batch.lua`, `src/main/java/com/vnpt/einvoice/gamification/reward/InvoiceClaimService.java` |
+| Streams runtime and exactly-once config | `src/main/java/com/vnpt/einvoice/gamification/config/RewardStreamsConfig.java` |
+| Topology, DLT filter, dedupe and window aggregation | `src/main/java/com/vnpt/einvoice/gamification/streams/RewardTopology.java`, `DedupeProcessor.java`, `WindowAggregatorProcessor.java` |
 | Leaderboard delta projector | `src/main/java/com/vnpt/einvoice/gamification/leaderboard/LeaderboardProjector.java`, `src/main/resources/scripts/apply_delta_batch.lua` |
 | Leaderboard, points, rank | `src/main/java/com/vnpt/einvoice/gamification/leaderboard/LeaderboardService.java` |
 | Discount tiers | `src/main/java/com/vnpt/einvoice/gamification/leaderboard/DiscountService.java` |
 | REST validation and errors | `src/main/java/com/vnpt/einvoice/gamification/exception/ApiExceptionHandler.java` |
-| Redis claim/projector tests | `src/test/java/com/vnpt/einvoice/gamification/reward/InvoiceClaimServiceIntegrationTest.java`, `src/test/java/com/vnpt/einvoice/gamification/leaderboard/LeaderboardApplyServiceIntegrationTest.java` |
+| Streams and Redis tests | `src/test/java/com/vnpt/einvoice/gamification/streams/RewardTopologyTest.java`, `src/test/java/com/vnpt/einvoice/gamification/leaderboard/LeaderboardApplyServiceIntegrationTest.java` |
 
-### Stage 2A Lua scripts
+### Stage 2B Lua script
 
-- `src/main/resources/scripts/claim_invoice_batch.lua`: exact invoice claim, company aggregation, recoverable claim marker.
 - `src/main/resources/scripts/apply_delta_batch.lua`: delta dedupe, company coalescing, leaderboard update and recovery.
 
-Both scripts are executed with `EVALSHA` and use one atomic execution per Kafka batch.
+The script is executed with `EVALSHA` and uses one atomic execution per Kafka batch. Invoice dedupe is owned by the Streams state store, not by Redis.
 
 ## Phase 3 — Local testing
 
@@ -206,7 +204,7 @@ KAFKA_BOOTSTRAP_SERVERS=localhost:19092 REDIS_PORT=16379 \
 mvn spring-boot:run -Dspring-boot.run.arguments=--server.port=18080
 ```
 
-The application creates `invoice-events` with 12 partitions and starts 12 consumer threads. If the topic already exists with fewer partitions, recreate it or increase the partition count before running.
+The application creates `invoice-events` and `company-reward-deltas` with 12 partitions, starts a 6-thread Kafka Streams topology (application id `einvoice-reward-streams`) and a 12-listener projector consumer group. Streams creates its internal changelog topics on first start. If the topics already exist with fewer partitions, recreate them or increase the partition count before running.
 
 ### 3. Simulate an invoice
 
@@ -331,14 +329,14 @@ curl -s -X POST http://localhost:8080/api/invoices/simulate \
   -d '{"invoiceId":"INV-1001","companyId":"COMPANY-A"}'
 ```
 
-Wait for zero lag, then:
+Wait until the 500 ms window flush and the projector have run (normally under two seconds), then:
 
 ```bash
 curl -s http://localhost:8080/api/companies/COMPANY-A/points
 docker compose exec -T redis redis-cli ZSCORE einv:leaderboard COMPANY-A
 ```
 
-Both values remain `10`. The Kafka event is new, but the business invoice ID already exists.
+Both values remain `10`. The Kafka event is new, but the invoice ID already exists in the Streams dedupe store.
 
 ### 9. Test concurrent duplicate processing
 
@@ -349,7 +347,7 @@ seq 1 100 | xargs -P 20 -I{} curl -fsS -o /dev/null \
   -d '{"invoiceId":"INV-CONCURRENT-100","companyId":"COMPANY-C"}'
 ```
 
-Wait for zero lag, then:
+Wait for the window flush and projector, then:
 
 ```bash
 curl -s http://localhost:8080/api/companies/COMPANY-C/points
@@ -357,7 +355,7 @@ curl -s http://localhost:8080/api/companies/COMPANY-C/points
 
 Expected: `{"companyId":"COMPANY-C","points":10}`.
 
-The JUnit integration test also submits the same event from 32 virtual threads to real Redis and asserts exactly one batch reports a new reward.
+`RewardTopologyTest` also feeds duplicate invoice IDs into the topology and asserts that only one delta is emitted. The live restart test replays an invoice that was processed before an application restart and confirms no new delta and no extra points.
 
 ### 10. Run automated tests
 
@@ -366,15 +364,15 @@ export JAVA_HOME=$(/usr/libexec/java_home -v 25)
 mvn test
 ```
 
-Expected: **25 JUnit 5 tests**, 0 failures, 0 errors. Testcontainers covers invoice claim recovery/concurrency and delta projector dedupe/aggregation. Processor/projector tests cover Kafka handoff and DLT.
+Expected: **23 JUnit 5 tests**, 0 failures, 0 errors. Testcontainers covers delta Lua dedupe/aggregation/recovery against real Redis. `TopologyTestDriver` covers invoice dedupe, 500 ms window aggregation, the DLT filter and the delta output contract. The projector test covers batch handoff and invalid-delta skipping.
 
 ### 11. Run the performance benchmark
 
 Run from the project root. These commands delete all keys in the local POC Redis instance; do not point them at shared Redis.
 
-#### Stage 1 direct Kafka benchmark
+#### Stage 2B direct Kafka benchmark
 
-This publishes 100,000 unique events with the same JSON serializer contract as the application, waits for every producer acknowledgment and all 1,000,000 points, then measures leaderboard p95.
+This publishes 100,000 unique events with the same JSON serializer and key contract (`invoiceId`) as the application, waits for every producer acknowledgment and all 1,000,000 points, then measures leaderboard p95.
 
 ```bash
 mvn -q package
@@ -415,29 +413,30 @@ java -cp "target/classes:$(cat /tmp/gamification-classpath.txt)" \
 
 Environment: macOS arm64, Docker Desktop 29.7.2, Temurin Java 25.0.3, local single-node Kafka and Redis with AOF. The machine was also running other containers, so throughput variance was high.
 
-| Metric | Target | Stage 2A measured |
+| Metric | Target | Stage 2B measured |
 |---|---:|---:|
-| Producer-acked unique events/s | — | 98,231.42 |
-| Two-hop Kafka end-to-end unique events/s | 100,000 | **64,461.46** |
-| Leaderboard p95 | about 5 ms | 1.56 ms post-drain |
-| Correct points | 1,000,000 | passed |
-| Duplicate batch smoke | no extra points | passed; 2 unique invoices = 20 points |
-| Invoice claim Set | 2 IDs | passed |
-| Delta Set | 1 company delta | passed |
+| Producer-acked unique events/s | — | 51,084.56–92,933.16 |
+| Two-hop Kafka end-to-end unique events/s | 100,000 | **60,311.12 best**; repeated runs 34,989.60–60,311.12 |
+| Final reviewed-config run | — | 50,503.00 events/s, p95 2.45 ms |
+| Leaderboard p95 | about 5 ms | 1.07–2.45 ms post-drain |
+| Correct points | 1,000,000 | passed on all four runs |
+| Duplicate replay | no extra points | passed; 3 unique invoices = 30 points, resend produced no delta |
+| Restart dedupe | no extra points | passed; pre-restart invoice replayed after 36 s state restore, no new delta |
+| JUnit 5 | — | 23/23 passed |
 
-Stage 2A adds one Kafka hop and synchronous delta publication per company, so this run is slower than the best Stage 1 direct result. The p95 is still a post-drain sequential read, not an SLO proof under concurrent load. The **100k/s gate remains unmet**.
+Stage 2B runs measured 34,989.60 / 56,890.97 / 60,311.12 events/s before the final `read_committed` change; the final reviewed config measured 50,503.00 events/s with p95 2.45 ms. The 36-second restore figure is one local restart with about 300k invoice keys, not a production SLO. The p95 is still a post-drain sequential read, not an SLO proof under concurrent load. The **100k/s gate remains unmet**; per-invoice RocksDB work, window punctuation, one extra Kafka hop and a shared host are the visible costs.
 
 Full machine-readable output: `docs/benchmark-results.json`.
 
-### Stage 2B and remaining bottlenecks
+### Remaining bottlenecks and next scaling steps
 
-- Invoice exact dedupe still uses a Redis Set rather than a partitioned Kafka Streams/RocksDB state store.
-- Delta publication is synchronous per company in this POC.
-- Delta volume is one record per company per invoice batch; a true high-throughput design should aggregate by time window before Kafka.
-- The local producer, application, Redis and unrelated containers share CPU.
-- Twelve consumers are enough for this intermediate stage, not for 1M/s.
+- The dedupe store has no retention window. At 1M/s a day of invoice IDs is 86.4 billion keys; the store needs a documented business TTL or an external ledger before claiming that scale.
+- `selectKey(companyId)` does not insert a repartition topic in this POC, so one company's deltas can be spread across input partitions. A production projector should consume a company-keyed topic.
+- The aggregator scans its RocksDB window store every 250 ms and emits from wall-clock punctuation. Late events are still counted, but they can be emitted after their nominal window.
+- Kafka EOS covers offsets, state and delta output only. Redis application is idempotent but not transactional; the delta Set grows with every delta and only pending markers have a TTL.
+- The local producer, application, Redis and unrelated containers share CPU. Twelve partitions and six Streams threads are a Stage 2 POC choice, not a 1M/s design.
 
-Stage 2B should replace the Redis claim Set with the partitioned exact state store and add time-window aggregation before `company-reward-deltas`, as described in `DEEP_RESEARCH_1M_EVENTS_ARCHITECTURE.md` and `docs/adr/0001-million-event-architecture.md`.
+Stage 3 scaling steps — larger partition counts, partitioned exact state with expiry, repartition/coalescing, dedicated leaderboard infrastructure and a 1M/s capacity run — are in `DEEP_RESEARCH_1M_EVENTS_ARCHITECTURE.md` and `docs/roadmap/1m-events-roadmap.md`.
 
 ## Validation and error behavior
 
@@ -446,8 +445,9 @@ Stage 2B should replace the Redis claim Set with the partitioned exact state sto
 - A non-JSON content type returns `415`.
 - The API queues Kafka publishing asynchronously and returns `202` with status `PUBLISHING`; asynchronous delivery failures are logged, so clients retry with the same `invoiceId` when needed.
 - Redis read failure returns `503`.
-- Consumer Redis failure is not committed. The POC retries the full batch every second until processing succeeds.
-- Invalid event types or missing fields are routed to `invoice-events.DLT`; Kafka deserialization failures still require operations follow-up.
+- Projector Redis failure is not committed. The POC retries the full batch every second until processing succeeds.
+- The projector consumes with `isolation.level=read_committed`, so aborted Streams transactions are not applied.
+- Invalid event types or missing fields are routed by the topology to `invoice-events.DLT`; Kafka deserialization failures still require operations follow-up.
 
 ## Shutdown
 

@@ -39,21 +39,25 @@ Mỗi stage phải có **exit criteria đo được**. Không tăng partition, c
 
 ## Stage 2 — 300k events/s và tách correctness state
 
-**Trạng thái:** Stage 2A đã code xong. Pipeline hiện là `invoice-events → invoice claim/aggregate → company-reward-deltas → leaderboard projector → Redis`. Exact invoice claim vẫn dùng Redis Set; partitioned state store và time-window aggregation trước Kafka là Stage 2B. Benchmark Stage 2A: 64.461,46 events/s end-to-end, p95 1,56 ms post-drain.
+**Trạng thái:** Stage 2A và Stage 2B đã code xong; gate 300k/s chưa đạt. Pipeline hiện là `invoice-events → Kafka Streams dedupe/aggregate 500 ms → company-reward-deltas → leaderboard projector → Redis`. Exact invoice dedupe nằm trong RocksDB state store có changelog, không còn Redis Set. Benchmark Stage 2B: best 60.311,12 events/s end-to-end, bốn run 34.989,60–60.311,12, p95 1,07–2,45 ms post-drain; final config 50.503,00 events/s. Replay sau restart không tạo delta mới; restore ~300k keys mất 36 giây trên máy local.
+
+**Đã làm:** topic delta, Streams `exactly_once_v2`, RocksDB dedupe + changelog, window 500 ms, projector `read_committed`, batch Lua với delta Set và PENDING marker, 23 test pass.
+
+**Chưa làm:** 64 partitions/RF3, `deltaId` deterministic, repartition topic theo `companyId`, retention/expiry cho dedupe store, dedicated Redis, outbox, chaos test, rebuild drill, capacity gate 300k/s.
 
 ### Công việc
 
-- [ ] Thêm topic `company-reward-deltas` với `deltaId` deterministic.
-- [ ] Reward processor aggregate theo time-window 100–500 ms.
-- [ ] Chọn state store sau spike: Kafka Streams + RocksDB hoặc Cassandra/Scylla LWT.
-- [ ] Với Kafka Streams: publish delta và commit offset/state bằng transaction.
+- [ ] Thêm topic `company-reward-deltas` với `deltaId` deterministic. *(topic có; `deltaId` hiện là UUID + company + windowStart, chưa deterministic — còn thiếu)*
+- [x] Reward processor aggregate theo time-window 100–500 ms.
+- [x] Chọn state store sau spike: Kafka Streams + RocksDB.
+- [x] Với Kafka Streams: publish delta và commit offset/state bằng transaction.
 - [ ] Với external LWT: implement state machine `CLAIMED → EMITTED` và outbox/delta intent; không tuyên bố Kafka EOS.
-- [ ] Repartition output theo `companyId`; projector coalesce cùng company trước Redis; freeze output topology hoặc drain/fence/migrate pending trước khi đổi partition count.
-- [ ] Projector dùng `isolation.level=read_committed`, Lua atomic với source `deltaId` markers + `projectorBatchId = hash(topic, partition, firstOffset, lastOffset, schemaVersion)`; cho phép offset gap hợp lệ.
+- [ ] Repartition output theo `companyId`; projector coalesce cùng company trước Redis; freeze output topology hoặc drain/fence/migrate pending trước khi đổi partition count. *(projector coalesce đã có; repartition topic và freeze procedure chưa có)*
+- [x] Projector dùng `isolation.level=read_committed`, Lua atomic với source `deltaId` markers. *(marker hiện theo `topic:partition`, chưa phải hash range; chưa có xử lý offset gap cho transaction control)*
 - [ ] Dedicated leaderboard Redis; đo write rate và marker operation rate sau coalesce.
 - [ ] Transactional outbox cho REST acceptance nếu invoice service chưa có.
-- [ ] Chaos test: crash giữa claim và emit, abort transaction, Redis failover, consumer rebalance.
-- [ ] Kiểm thử restoration state store dưới tải và rebuild leaderboard từ snapshot + manifest offset theo từng partition.
+- [ ] Chaos test: crash giữa claim và emit, abort transaction, Redis failover, consumer rebalance. *(mới có restart + replay thủ công)*
+- [ ] Kiểm thử restoration state store dưới tải và rebuild leaderboard từ snapshot + manifest offset theo từng partition. *(restore sau restart đã chạy một lần, chưa dưới tải, chưa rebuild drill)*
 
 ### Exit criteria
 

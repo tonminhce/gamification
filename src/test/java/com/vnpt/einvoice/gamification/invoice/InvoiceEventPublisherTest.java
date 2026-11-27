@@ -32,8 +32,8 @@ class InvoiceEventPublisherTest {
     KafkaTemplate<String, InvoiceIssuedEvent> kafkaTemplate;
 
     @Test
-    void publishesWithCompanyIdAsKafkaKey() {
-        when(kafkaTemplate.send(eq("invoice-events"), eq("COMPANY-A"), any()))
+    void publishesWithInvoiceIdAsKafkaKey() {
+        when(kafkaTemplate.send(eq("invoice-events"), eq("INV-1"), any()))
                 .thenReturn(CompletableFuture.completedFuture(null));
         InvoiceEventPublisher publisher = new InvoiceEventPublisher(kafkaTemplate, "invoice-events");
 
@@ -43,7 +43,7 @@ class InvoiceEventPublisherTest {
 
         ArgumentCaptor<InvoiceIssuedEvent> captor = ArgumentCaptor.forClass(InvoiceIssuedEvent.class);
         org.mockito.Mockito.verify(kafkaTemplate)
-                .send(eq("invoice-events"), eq("COMPANY-A"), captor.capture());
+                .send(eq("invoice-events"), eq("INV-1"), captor.capture());
         assertEquals("INV-1", captor.getValue().invoiceId());
         assertEquals(InvoiceIssuedEvent.TYPE, captor.getValue().eventType());
         assertEquals("PUBLISHING", response.status());
@@ -68,7 +68,7 @@ class InvoiceEventPublisherTest {
 
     @Test
     void mapsSynchronousKafkaFailureToApiFailure() {
-        when(kafkaTemplate.send(eq("invoice-events"), eq("COMPANY-A"), any()))
+        when(kafkaTemplate.send(eq("invoice-events"), eq("INV-1"), any()))
                 .thenThrow(new KafkaException("broker unavailable"));
         InvoiceEventPublisher publisher = new InvoiceEventPublisher(kafkaTemplate, "invoice-events");
 

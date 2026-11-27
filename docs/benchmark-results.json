@@ -170,6 +170,76 @@
       "p95MeasuredUnderLoad": false
     }
   },
+  "stage2BStreamsState": {
+    "measuredAt": "2026-11-27T08:53:37Z",
+    "configuration": {
+      "totalUniqueEvents": 100000,
+      "companyCount": 20,
+      "topics": "invoice-events → company-reward-deltas",
+      "invoiceDedupe": "Kafka Streams persistent RocksDB invoice-dedupe-store with changelog",
+      "aggregation": "500 ms event-time window, emitted by 250 ms wall-clock punctuation",
+      "producerKey": "invoiceId",
+      "streamsProcessingGuarantee": "exactly_once_v2",
+      "projectorIsolation": "read_committed (final config only)",
+      "streamsThreads": 6,
+      "projectorListeners": 12,
+      "note": "The first three runs were measured before isolation.level=read_committed was added; the final run uses the reviewed config."
+    },
+    "runs": [
+      {
+        "runId": "DIRECT-1795769464824",
+        "producerAckedEventsPerSecond": 51084.56,
+        "twoHopEndToEndEventsPerSecond": 34989.60,
+        "leaderboardP95Ms": 2.12,
+        "expectedPoints": 1000000,
+        "observedPoints": 1000000
+      },
+      {
+        "runId": "DIRECT-1795769476895",
+        "producerAckedEventsPerSecond": 83334.24,
+        "twoHopEndToEndEventsPerSecond": 56890.97,
+        "leaderboardP95Ms": 1.80,
+        "expectedPoints": 1000000,
+        "observedPoints": 1000000
+      },
+      {
+        "runId": "DIRECT-1795769481706",
+        "producerAckedEventsPerSecond": 92933.16,
+        "twoHopEndToEndEventsPerSecond": 60311.12,
+        "leaderboardP95Ms": 1.07,
+        "expectedPoints": 1000000,
+        "observedPoints": 1000000
+      },
+      {
+        "runId": "DIRECT-1795769616319",
+        "note": "Final reviewed config with read_committed.",
+        "producerAckedEventsPerSecond": 68905.03,
+        "twoHopEndToEndEventsPerSecond": 50503.00,
+        "leaderboardP95Ms": 2.45,
+        "expectedPoints": 1000000,
+        "observedPoints": 1000000
+      }
+    ],
+    "bestRun": {
+      "runId": "DIRECT-1795769481706",
+      "producerAckedEventsPerSecond": 92933.16,
+      "twoHopEndToEndEventsPerSecond": 60311.12,
+      "leaderboardP95Ms": 1.07
+    },
+    "correctness": {
+      "duplicateBatchSmoke": "3 unique invoices = 30 points; resend produced no new delta and total points unchanged",
+      "restartReplay": "invoice processed before restart replayed after state restore: no new delta, points unchanged",
+      "stateRestoreSeconds": 36,
+      "stateStoreKeysAtRestore": "about 300k",
+      "finalRunDuplicateReplay": "delta log offsets 6353 → 6353, total points unchanged",
+      "junitTests": "23 passed"
+    },
+    "targetAssessment": {
+      "oneHundredThousandEventsPerSecondMet": false,
+      "p95MeasuredUnderLoad": false,
+      "note": "Best 60,311.12 events/s on a shared host; p95 is a post-drain sequential read. Dedupe store has no retention policy and deltas are not repartitioned by company."
+    }
+  },
   "baselineBeforeOptimization": {
     "endToEndEventsPerSecond": 5602.61,
     "leaderboardP95Ms": 5.051,

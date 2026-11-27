@@ -58,16 +58,17 @@ public class KafkaLoadProducer {
                 serializer
         )) {
             for (int i = 0; i < total; i++) {
+                String invoiceId = runId + "-" + i;
                 String companyId = runId + "-COMPANY-" + (i % companies);
                 InvoiceIssuedEvent event = new InvoiceIssuedEvent(
                         UUID.randomUUID().toString(),
                         InvoiceIssuedEvent.TYPE,
                         InvoiceIssuedEvent.SCHEMA_VERSION,
-                        runId + "-" + i,
+                        invoiceId,
                         companyId,
                         Instant.now()
                 );
-                futures.add(producer.send(new ProducerRecord<>(topic, companyId, event)));
+                futures.add(producer.send(new ProducerRecord<>(topic, invoiceId, event)));
             }
             for (Future<?> future : futures) {
                 future.get();

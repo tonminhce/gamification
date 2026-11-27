@@ -58,18 +58,6 @@ public class KafkaConfig {
     }
 
     @Bean
-    ProducerFactory<String, Object> objectProducerFactory(KafkaProperties properties) {
-        return new DefaultKafkaProducerFactory<>(properties.buildProducerProperties());
-    }
-
-    @Bean
-    KafkaTemplate<String, Object> objectKafkaTemplate(
-            ProducerFactory<String, Object> producerFactory
-    ) {
-        return new KafkaTemplate<>(producerFactory);
-    }
-
-    @Bean
     DefaultErrorHandler kafkaErrorHandler() {
         // Keep retrying without acknowledging so a failed update cannot be skipped.
         return new DefaultErrorHandler(new FixedBackOff(1_000L, Long.MAX_VALUE));

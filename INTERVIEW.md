@@ -11,7 +11,7 @@ Components communicate by publishing events rather than calling each other direc
 Invoice issuance should not wait for leaderboard maintenance. Kafka also allows reward processing to scale and recover independently.
 
 **Where is it implemented?**  
-`src/main/java/com/vnpt/einvoice/gamification/invoice/InvoiceEventPublisher.java:44` publishes the event. `src/main/java/com/vnpt/einvoice/gamification/consumer/InvoiceRewardProcessor.java:21` consumes it.
+`src/main/java/com/vnpt/einvoice/gamification/invoice/InvoiceEventPublisher.java:47` publishes the event. The Kafka Streams topology in `src/main/java/com/vnpt/einvoice/gamification/streams/RewardTopology.java` consumes it, with `DedupeProcessor` owning the idempotency check.
 
 **Interviewer questions**
 
@@ -51,16 +51,16 @@ A producer writes records to a topic. A consumer reads records, processes them, 
 The producer transports invoice facts. The consumer applies reward logic and reads the leaderboard separately.
 
 **Where is it implemented?**  
-Producer settings: `src/main/resources/application.yml:14`. Typed producer factory: `src/main/java/com/vnpt/einvoice/gamification/config/KafkaConfig.java`. Consumer: `InvoiceRewardProcessor.java:21`.
+Producer settings: `src/main/resources/application.yml:14`. Typed producer factory: `src/main/java/com/vnpt/einvoice/gamification/config/KafkaConfig.java`. Consumer: the Streams topology in `src/main/java/com/vnpt/einvoice/gamification/streams/RewardTopology.java`; the leaderboard projector is a second consumer in `LeaderboardProjector.java`.
 
 **Interviewer questions**
 
-- Why is the Kafka key `companyId`?
+- Why is the Kafka key `invoiceId`?
 - What does `acks=all` guarantee?
 - What does producer idempotence guarantee?
 
 **Senior answer**  
-“The key keeps one company's events in one partition, preserving their order. `acks=all` waits for all in-sync replicas; with one replica in this POC, it effectively waits for the broker. Producer idempotence prevents duplicates caused by producer retries, but it does not stop a user or upstream system from publishing the same business invoice twice.”
+“The key is `invoiceId` because invoice identity is the dedupe key. Keying by company would put duplicate invoices for the same company on one partition, but a duplicate retry could still hash to the same partition only if the key matches the business identity; keying by invoiceId makes the guarantee explicit. The trade-off is that one company's events can span partitions, so the topology re-keys to `companyId` for window aggregation. `acks=all` waits for all in-sync replicas; with one replica in this POC, it effectively waits for the broker. Producer idempotence prevents duplicates caused by producer retries, but it does not stop a user or upstream system from publishing the same business invoice twice.”
 
 ## 4. Kafka Consumer Groups and Partitions
 
@@ -68,10 +68,10 @@ Producer settings: `src/main/resources/application.yml:14`. Typed producer facto
 A topic is split into ordered partitions. A consumer group divides partitions among consumers so each partition is processed by one group member at a time.
 
 **Why do we need it here?**  
-Three partitions allow three consumer threads to process different companies in parallel.
+Twelve partitions let six Streams threads share invoice processing, and twelve projector listeners apply delta partitions in parallel.
 
 **Where is it implemented?**  
-Group and concurrency: `src/main/resources/application.yml:22` and `src/main/resources/application.yml:34`. Topic creation: `src/main/java/com/vnpt/einvoice/gamification/config/KafkaConfig.java`.
+Streams threads: `src/main/resources/application.yml:56`. Projector concurrency: `src/main/resources/application.yml:41`. Topic creation: `src/main/java/com/vnpt/einvoice/gamification/config/KafkaConfig.java`.
 
 **Interviewer questions**
 
@@ -91,7 +91,7 @@ An offset is the position of the next record to read in a partition. At-least-on
 A crash after Redis succeeds but before the offset commits causes redelivery. The reward must remain correct.
 
 **Where is it implemented?**  
-Auto commit is disabled at `src/main/resources/application.yml:25`. Batch acknowledgment is configured at `src/main/resources/application.yml:33`. The listener returns only after the full batch succeeds at `InvoiceRewardProcessor.java:21`.
+Streams uses `exactly_once_v2` in `src/main/java/com/vnpt/einvoice/gamification/config/RewardStreamsConfig.java:39`, so input offsets and state/output commit together. The projector disables auto-commit (`src/main/resources/application.yml:29`) and uses batch acknowledgment (`src/main/resources/application.yml:40`); the listener returns only after Redis succeeds in `LeaderboardProjector.java`.
 
 **Interviewer questions**
 
@@ -100,7 +100,7 @@ Auto commit is disabled at `src/main/resources/application.yml:25`. Batch acknow
 - What does committing a batch offset mean?
 
 **Senior answer**  
-“The batch is redelivered. Lua sees the existing processed Set entries and applied batch marker, so it does not add points again. Auto-commit can acknowledge records before processing finishes, so I disabled it. A committed batch offset means every record before that position completed successfully; otherwise the consumer must retry.”
+“For the invoice topic, the Streams transaction is not committed, so the input is reprocessed after restart; the dedupe state store is restored from its changelog and rejects the duplicate invoice IDs. For the projector, the delta batch is redelivered; Lua sees the existing delta Set entries and PENDING marker, so it does not add points again. Auto-commit can acknowledge records before processing finishes, so it is disabled. A committed batch offset means every record before that position completed successfully; otherwise the consumer must retry.”
 
 ## 6. Idempotency
 
@@ -111,7 +111,7 @@ Repeating the same operation has the same effect as performing it once.
 Kafka retries, producer retries, user retries, and batch redelivery can all repeat `INV-1001`.
 
 **Where is it implemented?**  
-`src/main/resources/scripts/claim_invoice_batch.lua` claims invoice IDs in a Redis Set and stores a recoverable `PENDING` claim marker until deltas are published. `InvoiceClaimService` invokes the script. The concurrency and partial-write tests are in `src/test/java/com/vnpt/einvoice/gamification/reward/InvoiceClaimServiceIntegrationTest.java`.
+`src/main/java/com/vnpt/einvoice/gamification/streams/DedupeProcessor.java` checks and writes `invoiceId` in the persistent RocksDB `invoice-dedupe-store`; the state is changelog-backed and committed with the same Streams transaction as the emitted delta. The projector separately deduplicates delta IDs in `einv:processed-deltas`. The topology test and live restart replay are in `src/test/java/com/vnpt/einvoice/gamification/streams/RewardTopologyTest.java`.
 
 **Interviewer questions**
 
@@ -120,7 +120,7 @@ Kafka retries, producer retries, user retries, and batch redelivery can all repe
 - What if the same invoice ID arrives for another company?
 
 **Senior answer**  
-“`invoiceId` is the business identity; `eventId` changes on every publish. Permanent keys are safest for this POC because an old duplicate can never award again. The cost is unbounded memory. A TTL is acceptable only if the business explicitly accepts re-award after expiry. The invoice claim marker is `PENDING` until the delta publish succeeds, then deleted; the projector tracks applied delta IDs separately, so a retry can recover an interrupted batch without awarding twice.”
+“`invoiceId` is the business identity; `eventId` changes on every publish. The current POC keeps keys without a TTL because an old duplicate must never award again, and the state store is restored from the changelog after a restart. The cost is unbounded storage — at 1M/s that is 86.4 billion IDs per day, so production needs a documented retention window or an external ledger. A TTL is acceptable only if the business explicitly accepts re-award after expiry. If the same invoice ID arrives for another company, the first claim wins; the second is treated as a duplicate and is not awarded. That is correct for an invoice identity but should be alerted as a data-quality signal.”
 
 ## 7. Atomicity
 
@@ -131,7 +131,7 @@ A group of changes appears indivisible to other clients.
 Checking “not processed” and incrementing points must be one indivisible decision.
 
 **Where is it implemented?**  
-Invoice claiming is in `src/main/resources/scripts/claim_invoice_batch.lua`; leaderboard application is in `src/main/resources/scripts/apply_delta_batch.lua`.
+Invoice dedupe and window state are updated in one Streams transaction (`exactly_once_v2` in `RewardStreamsConfig.java`). Leaderboard application is in `src/main/resources/scripts/apply_delta_batch.lua`.
 
 **Interviewer questions**
 
@@ -140,7 +140,7 @@ Invoice claiming is in `src/main/resources/scripts/claim_invoice_batch.lua`; lea
 - Why validate key types first?
 
 **Senior answer**  
-“Redis runs the script without interleaving other clients, so it is atomic for concurrency. It is not a rollback transaction: a runtime error does not undo earlier writes. I validate key types before writing. Claim and projector scripts use `PENDING` markers and pre-update scores so retries can distinguish a missing write from a write that succeeded before the marker was cleared. Company-keyed delta ordering and batch retry prevent another update for that company from interleaving before recovery. Inconsistent state is rejected for reconciliation, and the batch is not acknowledged.”
+“Redis runs the script without interleaving other clients, so it is atomic for concurrency. It is not a rollback transaction: a runtime error does not undo earlier writes. I validate key types before writing. The projector script uses `PENDING` markers and pre-update scores so retries can distinguish a missing write from a write that succeeded before the marker was cleared. On the Kafka side, Streams commits the dedupe write, window state and delta output in one transaction, so a crash cannot leave an invoice marked as processed without its delta being visible to a `read_committed` consumer. Redis itself is still outside the Kafka transaction; inconsistent partial Redis state is rejected for reconciliation, and the batch is not acknowledged.”
 
 ## 8. Race Conditions
 
@@ -148,10 +148,10 @@ Invoice claiming is in `src/main/resources/scripts/claim_invoice_batch.lua`; lea
 Correctness depends on timing between concurrent operations.
 
 **Why do we need it here?**  
-Separate `GET`, `SET`, and `ZINCRBY` calls allow two consumers to both see “not processed” and both add 10 points.
+Two consumers must never both see “invoice not processed” and both award 10 points. Redis `GET`/`SET`/`ZINCRBY` as separate calls in the projector have the same problem for delta application.
 
 **Where is it implemented?**  
-The race is removed by the atomic claim script under `src/main/resources/scripts/claim_invoice_batch.lua`. The concurrent claim test in `InvoiceClaimServiceIntegrationTest.java` exercises it against real Redis.
+The invoice race is removed by Kafka Streams partition ownership: one task owns each input partition, and the dedupe store is local to that task, so no other consumer can process the same invoice concurrently. On the Redis side, `src/main/resources/scripts/apply_delta_batch.lua` performs the delta dedupe and score update atomically.
 
 **Interviewer questions**
 
@@ -160,7 +160,7 @@ The race is removed by the atomic claim script under `src/main/resources/scripts
 - What about multiple application instances?
 
 **Senior answer**  
-“Consumer A reads no marker, consumer B reads no marker, then both write the marker and increment. A local Java lock only protects one JVM and would fail after horizontal scaling. The check and update must live in the shared Redis boundary, which is why I used Lua.”
+“With separate Redis calls, consumer A reads no marker, consumer B reads no marker, then both write the marker and increment. A local Java lock only protects one JVM and would fail after horizontal scaling. Moving invoice dedupe into the partition-owner state store removes the cross-instance race: Kafka guarantees one active task per partition, and Streams transactions make the state write and delta emit atomic. The remaining shared boundary is Redis, where the projector uses one Lua execution for the check and the update.”
 
 ## 9. Redis Sorted Sets
 
@@ -171,7 +171,7 @@ A Redis data structure that maps unique members to numeric scores and keeps them
 We need points, top-N ranking, and individual rank without scanning every company.
 
 **Where is it implemented?**  
-Score update: `src/main/resources/scripts/apply_delta_batch.lua`; invoice claim: `claim_invoice_batch.lua`. Top list: `src/main/java/com/vnpt/einvoice/gamification/leaderboard/LeaderboardService.java:36`. Individual competition rank: `LeaderboardService.java`.
+Score update: `src/main/resources/scripts/apply_delta_batch.lua`. Top list: `src/main/java/com/vnpt/einvoice/gamification/leaderboard/LeaderboardService.java:36`. Individual competition rank: `LeaderboardService.java`.
 
 **Interviewer questions**
 
@@ -191,7 +191,7 @@ Server-side code executed atomically inside Redis.
 It removes network round trips and prevents other clients from interleaving the idempotency check with the score update.
 
 **Where is it implemented?**  
-`claim_invoice_batch.lua` for invoice claims and `apply_delta_batch.lua` for leaderboard updates, loaded by their respective services.
+`apply_delta_batch.lua` for leaderboard updates, loaded and executed by `LeaderboardApplyService.java`. Invoice dedupe no longer uses Lua; it is a RocksDB state-store lookup in `DedupeProcessor.java`.
 
 **Interviewer questions**
 
@@ -200,7 +200,7 @@ It removes network round trips and prevents other clients from interleaving the 
 - What would you monitor?
 
 **Senior answer**  
-“Lua is short enough for this POC and works on dedicated keys. `MULTI/EXEC` could group commands, but Lua lets the marker state decide whether to increment, finalize, or reject an inconsistent partial update. Long scripts block Redis, so script duration is a key metric. I would monitor script errors, latency, memory, AOF health, and eviction.”
+“Lua is short enough for this POC and works on dedicated keys. `MULTI/EXEC` could group commands, but Lua lets the marker state decide whether to increment, finalize, or reject an inconsistent partial update. I removed the invoice claim from Redis because a Lua script on one shared Set does not scale with partition count; a partition-local state store with a changelog is a better fit for exact dedupe. Long scripts block Redis, so script duration is a key metric. I would monitor script errors, latency, memory, AOF health, and eviction.”
 
 ## 11. Time Complexity
 
@@ -231,7 +231,7 @@ Throughput is work completed per second. Latency is time for one request.
 The design targets high event throughput and low leaderboard latency, but optimizing one can hurt the other.
 
 **Where is it implemented?**  
-Kafka batching and the two-stage delta pipeline: `src/main/resources/application.yml`, `InvoiceClaimService`, and `LeaderboardApplyService`. Benchmarks: `scripts/KafkaLoadProducer.java`, `scripts/RestLoadProducer.java`, and `scripts/load-test.mjs`.
+Streams `exactly_once_v2`, window aggregation and the delta projector: `src/main/java/com/vnpt/einvoice/gamification/config/RewardStreamsConfig.java`, `src/main/java/com/vnpt/einvoice/gamification/streams/WindowAggregatorProcessor.java` and `LeaderboardApplyService`. Benchmarks: `scripts/KafkaLoadProducer.java`, `scripts/RestLoadProducer.java`, and `scripts/load-test.mjs`.
 
 **Interviewer questions**
 
@@ -240,7 +240,7 @@ Kafka batching and the two-stage delta pipeline: `src/main/resources/application
 - What is the trade-off?
 
 **Senior answer**  
-“Batch commits, asynchronous publishing, producer batching, and Redis pipelining raised the direct unique-event result from 5,603 to 11,514 events/s in the final run. Repeated direct runs ranged from 11,514 to 13,623 events/s. A top-N cache could reduce read latency further, but it introduces staleness and invalidation work. I would only add it after measuring a read bottleneck.”
+“Batch commits, asynchronous publishing, producer batching, window aggregation and one Redis Lua call per projector batch raised the direct unique-event result from 5,603 events/s in the earliest per-event pipeline to a 60,311 events/s best Stage 2B run; the final reviewed config measured 50,503 events/s. A top-N cache could reduce read latency further, but it introduces staleness and invalidation work. I would only add it after measuring a read bottleneck.”
 
 ## 13. p95 Latency
 
@@ -260,7 +260,7 @@ The target is approximately 5 ms p95, not just a good average.
 - What creates tail latency?
 
 **Senior answer**  
-“The Stage 2A run measured 1.56 ms p95 after ingest drained, not under concurrent load, so it is not a production guarantee. Tail latency can come from JVM pauses, GC, Redis contention, network scheduling, Kafka rebalances, or large responses. A real test needs production-like data, sustained load, multiple runs, and percentile reporting under concurrent reads and writes.”
+“The final Stage 2B run measured 2.45 ms p95 after ingest drained, across runs 1.07–2.45 ms; this is not measured under concurrent load, so it is not a production guarantee. Tail latency can come from JVM pauses, GC, Redis contention, network scheduling, Kafka rebalances, or the 500 ms window flush. A real test needs production-like data, sustained load, multiple runs, and percentile reporting under concurrent reads and writes.”
 
 ## 14. Horizontal Scaling
 
@@ -271,7 +271,7 @@ Adding more application instances to share work.
 Reward consumption can scale independently from the REST API.
 
 **Where is it implemented?**  
-Consumer group and concurrency are in `src/main/resources/application.yml:22` and `src/main/resources/application.yml:34`.
+Streams threads in `src/main/resources/application.yml:56`; projector concurrency in `src/main/resources/application.yml:40`.
 
 **Interviewer questions**
 
@@ -280,7 +280,7 @@ Consumer group and concurrency are in `src/main/resources/application.yml:22` an
 - What breaks first?
 
 **Senior answer**  
-“At most three consumers actively own partitions in this topic. More instances provide failover but no extra partition parallelism. Redis remains a shared single-threaded dependency in this POC, so consumer scaling eventually shifts the bottleneck to Redis. I would increase partitions and instances together, then measure Redis CPU, script latency, and memory.”
+“Six Streams threads share twelve input partitions; more than twelve active tasks would leave consumers idle. The projector has twelve listeners, one per delta partition. Adding instances provides failover and more partition parallelism, but it cannot exceed the partition count. Redis remains a shared single-threaded dependency in this POC, so consumer scaling eventually shifts the bottleneck to Redis. I would increase partitions and instances together, then measure Redis CPU, script latency, and memory.”
 
 ## 15. System Design Trade-offs
 
@@ -291,16 +291,16 @@ Choosing which guarantees and operational costs matter for the workload.
 The POC deliberately chooses simplicity, at-least-once delivery, permanent idempotency, and direct Redis reads.
 
 **Where is it implemented?**  
-The choices are visible in `application.yml`, both claim/projector Lua scripts, and `LeaderboardService.java`.
+The choices are visible in `application.yml`, `RewardStreamsConfig.java`, `apply_delta_batch.lua`, and `LeaderboardService.java`.
 
 **Interviewer questions**
 
-- Why no Kafka transactions?
-- Why no dead-letter topic in the POC?
+- Why not extend Kafka transactions to Redis?
+- Why is there a DLT in the POC?
 - What would you change for production?
 
 **Senior answer**  
-“Kafka transactions do not include an external Redis write, so they would not by themselves make the business effect exactly once. Redis idempotency is the key correctness mechanism. The POC retries indefinitely to avoid data loss, which also means a poison event can block its partition. Production needs bounded retries, a DLT, alerting, runbooks, Redis persistence/HA, backups, and a defined idempotency retention policy.”
+“Kafka transactions do not include an external Redis write, so they would not by themselves make the business effect exactly once. Streams uses `exactly_once_v2` internally for Kafka-to-Kafka correctness, and Redis idempotency covers the external sink. Invalid events go to `invoice-events.DLT`, but poison records that fail after valid processing still rely on retry. The POC retries indefinitely to avoid data loss, which also means a persistent Redis outage can block a partition. Production needs bounded retries, alerting, runbooks, Redis persistence/HA, backups, and a defined idempotency retention policy.”
 
 ## 16. Exactly-Once Semantics and Its Limits
 
@@ -311,7 +311,7 @@ A processing system appears to apply each event exactly once despite failures an
 It is a common interview follow-up because Kafka and Redis are separate systems.
 
 **Where is it implemented?**  
-There is no end-to-end exactly-once claim. Producer idempotence is enabled at `src/main/resources/application.yml:17`; business idempotency is implemented across `claim_invoice_batch.lua` and `apply_delta_batch.lua`.
+There is no end-to-end exactly-once claim. Streams runs with `exactly_once_v2` (`RewardStreamsConfig.java`), so Kafka offsets, dedupe/window state and delta output commit atomically. Business idempotency at the Redis sink is implemented in `apply_delta_batch.lua` plus the delta Set. Producer idempotence is enabled at `src/main/resources/application.yml:21`.
 
 **Interviewer questions**
 
@@ -320,7 +320,7 @@ There is no end-to-end exactly-once claim. Producer idempotence is enabled at `s
 - What guarantee does this POC actually provide?
 
 **Senior answer**  
-“Producer idempotence only deduplicates producer retries. Kafka transactions can provide exactly-once for Kafka-to-Kafka workflows, but Redis is outside that transaction. This POC provides at-least-once event delivery plus idempotent reward application. The observable business result is exactly one award per invoice under the tested failure model, but I would not label the whole pipeline exactly once.”
+“Producer idempotence only deduplicates producer retries. Streams transactions give exactly-once for Kafka-to-Kafka processing — input offsets, RocksDB state and delta output — but Redis is outside that transaction. This POC therefore provides exactly-once business processing through the delta topic and an idempotent Redis sink: the projector can be redelivered, but delta IDs prevent a second award. The observable business result is exactly one award per invoice under the tested failure model, yet I would not label the whole pipeline exactly once.”
 
 # Phase 5 — STAR interview story
 
@@ -330,26 +330,26 @@ VNPT's e-Invoice platform handles invoice-related events for many companies. The
 
 ## Task
 
-Build a small, reliable event-driven POC that separates invoice issuance from reward processing, updates points atomically, and keeps leaderboard reads fast. Stage 2A uses a two-hop delta pipeline and targets 100,000 events/s; the longer-term architecture targets 1M/s. These are targets to measure rather than claims.
+Build a small, reliable event-driven POC that separates invoice issuance from reward processing, updates points atomically, and keeps leaderboard reads fast. Stage 2B uses a Kafka Streams dedupe state store, 500 ms window aggregation, a reward-delta topic and a Redis projector. The target is 100,000 events/s and the longer-term architecture targets 1M/s. These are targets to measure rather than claims.
 
 ## Action
 
-I used one Spring Boot application with a two-stage reward pipeline. The invoice API supports single and batch requests and queues `INVOICE_ISSUED` events asynchronously. The invoice processor claims IDs in Redis, aggregates points per company, publishes `company-reward-deltas` to a second Kafka topic, and only then removes its recoverable claim marker. A separate projector consumes the delta topic, deduplicates delta IDs, coalesces by company, and applies one `ZINCRBY` per company using a recoverable Lua batch. Leaderboard reads use descending Sorted Set ranges, score lookups, and competition-rank counting.
+I used one Spring Boot application with a two-stage reward pipeline. The invoice API supports single and batch requests and queues `INVOICE_ISSUED` events asynchronously, keyed by `invoiceId`. A Kafka Streams topology with `exactly_once_v2` claims each invoice in a changelog-backed RocksDB store, drops duplicates, re-keys by `companyId`, and aggregates points in 500 ms windows. It emits one `CompanyRewardDelta` per company and window to a second Kafka topic. A separate projector consumes that topic with `read_committed`, deduplicates delta IDs, coalesces by company, and applies one `ZINCRBY` per company using a recoverable Lua batch. Leaderboard reads use descending Sorted Set ranges, score lookups, and competition-rank counting.
 
-I tested discount boundaries, duplicate delivery, concurrent claims with virtual threads, claim recovery, delta projector dedupe/aggregation, Kafka handoff, DLT, malformed REST input, and the full two-hop flow. I also ran a 100,000-event direct Kafka benchmark.
+I tested discount boundaries, duplicate delivery, topology dedupe and windowing, DLT filtering, delta projector dedupe/aggregation, malformed REST input, an application restart with a replayed invoice, and the full two-hop flow. I also ran four 100,000-event direct Kafka benchmarks and verified the exact 1,000,000 expected points every time.
 
 ## Result
 
-On the local Docker POC, the Stage 2A two-hop run measured 98,231.42 producer-acked events/s, 64,461.46 unique end-to-end events/s, and 1.56 ms leaderboard p95. All 1,000,000 expected points were present; two unique invoices plus one duplicate produced exactly 20 points, with two invoice claim IDs and one company delta.
+On the local Docker POC, the Stage 2B runs measured 34,989.60 to 60,311.12 unique end-to-end events/s; the final reviewed config measured 50,503.00 events/s. Leaderboard p95 was 1.07–2.45 ms post-drain. All four runs produced exactly 1,000,000 points. Three unique invoices plus a resend produced 30 points and no extra delta, and replaying a pre-restart invoice produced no new delta after a 36-second state restore.
 
-These are local POC results, not VNPT production measurements. Stage 2A still uses Redis Sets for exact claims and synchronous per-company delta publication; the 100,000 events/s gate is not met. Stage 2B is the partitioned exact state store and time-window aggregation before the delta topic.
+These are local POC results, not VNPT production measurements. The 100,000 events/s gate is still unmet, the dedupe store has no retention policy, and one company's deltas are not repartitioned into a single partition. Stage 3 addresses partition scaling, exact-state expiry and a 1M/s capacity run.
 
 ## Natural 1–2 minute English interview explanation
 
 “I built a small VNPT e-Invoice gamification POC to practice the backend design rather than claim a production system. The invoice API validates the request, queues an `INVOICE_ISSUED` event asynchronously, and returns 202 with publishing status, so reward processing does not block invoice issuance.
 
-The reward pipeline has two stages. The invoice processor claims invoice IDs, aggregates points per company, and publishes company deltas to a second Kafka topic. A separate projector deduplicates those deltas, coalesces by company, and updates the leaderboard. Each stage uses a recoverable per-partition marker, so a retry can finish safely without double awards. That handles Kafka redelivery, producer retries, and concurrent consumers.
+The reward pipeline has two stages. A Kafka Streams topology uses a partitioned RocksDB state store to deduplicate invoice IDs, aggregates points over 500 ms windows, and publishes company deltas to a second Kafka topic with exactly-once processing. A separate projector reads that topic with `read_committed`, deduplicates delta IDs, coalesces by company, and updates the leaderboard with one atomic Lua call per batch. That handles Kafka redelivery, producer retries, restarts, and concurrent consumers without double awards.
 
 Leaderboard reads use Redis Sorted Sets directly, so top-N, points, and rank do not require scanning a database. Discounts are calculated from the current score.
 
-I verified duplicate and concurrent behavior with real Redis and ran 100,000-event direct Kafka benchmarks. Stage 2A measured 64,461.46 unique end-to-end events per second and 1.56 ms p95 leaderboard latency. The 100k gate was not met, so I would not present that as production capacity. The next step is Stage 2B: partitioned exact state store and time-window aggregation.”
+I verified duplicate and restart behavior and ran four 100,000-event direct Kafka benchmarks. The best Stage 2B run measured 60,311 unique end-to-end events per second, the final config measured 50,503, and p95 was 1.07–2.45 ms post-drain. The 100k gate was not met, so I would not present that as production capacity. The next step is Stage 3: larger partition counts, exact-state retention and a measured 1M/s capacity run.”
