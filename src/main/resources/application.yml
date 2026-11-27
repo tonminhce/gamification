@@ -55,6 +55,7 @@ app:
   streams:
     application-id: einvoice-reward-streams
     threads: 6
+    commit-interval-ms: 500
     state-dir: /tmp/einvoice-reward-streams
   leaderboard:
     key: einv:leaderboard

@@ -2,7 +2,7 @@
 
 A single Spring Boot application that simulates invoice issuance, publishes `INVOICE_ISSUED` events to Kafka, deduplicates and aggregates them in a Kafka Streams topology, and applies idempotent reward deltas to a Redis leaderboard through Lua.
 
-Stack: Java 25, Spring Boot 4.2.0, Spring Kafka 4.2.0, Kafka 4.1.0, Kafka Streams 4.4.0, Redis 7.4, Maven, Docker Compose, JUnit 5.14.4.
+Stack: Java 25, Spring Boot 4.2.0, Spring Kafka 4.2.0, Kafka 4.4.0, Kafka Streams 4.4.0, Redis 7.4, Maven, Docker Compose, JUnit 5.14.4.
 
 ## Phase 1 — Simple system design
 
@@ -26,10 +26,10 @@ flowchart LR
 
 1. `POST /api/invoices/simulate` accepts one invoice; `POST /api/invoices/batch` accepts up to 1,000 invoices.
 2. The producer uses `invoiceId` as the Kafka key and returns `202 Accepted` with status `PUBLISHING` after queuing the asynchronous send.
-3. Kafka Streams consumes `invoice-events` across 12 partitions with `exactly_once_v2`. The dedupe processor checks its persistent RocksDB store keyed by `invoiceId`; an existing key is dropped before any aggregation.
+3. Kafka Streams consumes `invoice-events` across 12 partitions with `exactly_once_v2`. The dedupe processor checks an in-heap Bloom filter and then its persistent RocksDB store keyed by `invoiceId`; an existing key is dropped before any aggregation.
 4. New invoices are re-keyed to `companyId` and accumulated in a 500 ms event-time window. A wall-clock punctuator emits one `CompanyRewardDelta` per company per completed window to `company-reward-deltas`.
 5. The leaderboard projector consumes the delta topic with `isolation.level=read_committed`, deduplicates delta IDs in Redis, coalesces by company, and applies `ZINCRBY` in one recoverable Lua batch.
-6. Streams commits input offsets, state-store writes and output records in one Kafka transaction. The projector commits its batch offset only after Redis succeeds; failures redeliver and are absorbed by the delta Set and pending marker.
+6. Streams commits input offsets, state-store writes and output records in one Kafka transaction every 500 ms. The projector commits its batch offset only after Redis succeeds; failures redeliver and are absorbed by the delta Set and pending marker.
 7. Leaderboard endpoints read Redis Sorted Sets directly. Discounts are calculated from current points.
 
 ### Kafka event JSON
@@ -75,7 +75,10 @@ Company points, rank, and discount are derived from the leaderboard; no duplicat
 - **Optional repartition by company.** The topology re-keys aggregated events to `companyId` without an explicit repartition topic. This keeps the POC topology small, but deltas for one company can originate from several input partitions. The projector still coalesces per batch and delta IDs are unique.
 - **Redis AOF persistence.** Compose enables AOF with `appendfsync everysec` and a named volume. This is not HA and not a substitute for backups.
 - **Consistent competition ranks.** `ZREVRANGE WITHSCORES` returns sorted scores, and top-N ranks are calculated from adjacent equal scores. The company-rank endpoint uses `1 + ZCOUNT key (score +inf`, so equal scores share a rank. `ZREVRANK` is O(log N) but returns an ordinal position for ties, so it is not used for the public rank semantics.
-- **Twelve partitions, six Streams threads and twelve projector listeners.** Partitions bound Streams parallelism; six threads keep two partitions per thread while the projector uses one listener per delta partition. More threads were not re-tested for Stage 2B.
+- **Twelve partitions, six Streams threads and twelve projector listeners.** Partitions bound Streams parallelism; six threads keep two partitions per thread while the projector uses one listener per delta partition. Twelve Streams threads did not improve the local benchmark and raised p95.
+- **500 ms commit interval.** Streams commits offsets, state and output every 500 ms instead of the 100 ms default. This reduced transaction overhead and improved the 1M-event runs while keeping freshness within roughly one second.
+- **Bloom negative cache for invoice dedupe.** Each Streams task keeps an in-heap Bloom filter of its invoice store. First-seen invoices skip the RocksDB read; a filter hit still checks the store, so false positives never drop a valid invoice. The filter is rebuilt by scanning the store on startup and costs about 8 MB per task at 4M expected keys.
+- **Kafka 4.4.0 broker.** Kafka 4.1.0 brokers can crash the transaction coordinator with a negative histogram value (KAFKA-19888), which shut down the Streams client in testing. Broker 4.4.0 matches the client jars and the tested runs completed without that failure.
 
 ## Phase 2 — Complete working implementation
 
@@ -372,7 +375,7 @@ Run from the project root. These commands delete all keys in the local POC Redis
 
 #### Stage 2B direct Kafka benchmark
 
-This publishes 100,000 unique events with the same JSON serializer and key contract (`invoiceId`) as the application, waits for every producer acknowledgment and all 1,000,000 points, then measures leaderboard p95.
+This publishes 1,000,000 unique events with the same JSON serializer and key contract (`invoiceId`) as the application, waits for every producer acknowledgment and all 10,000,000 points, then measures leaderboard p95. The output also reports the backlog at producer end and the drain rate.
 
 ```bash
 mvn -q package
@@ -380,8 +383,10 @@ mvn -q dependency:build-classpath -Dmdep.outputFile=/tmp/gamification-classpath.
 docker compose exec -T redis redis-cli FLUSHDB
 
 java -cp "target/classes:$(cat /tmp/gamification-classpath.txt)" \
-  scripts/KafkaLoadProducer.java 100000 20 localhost:19092 invoice-events http://localhost:18080
+  scripts/KafkaLoadProducer.java 1000000 20 localhost:19092 invoice-events http://localhost:18080
 ```
+
+A short 100,000-event run is still useful as a smoke test, but it overstates the fixed window/drain latency and is not the gate measurement.
 
 Use `localhost:9092` and `http://localhost:8080` for the default ports.
 
@@ -411,30 +416,36 @@ java -cp "target/classes:$(cat /tmp/gamification-classpath.txt)" \
 
 ### Measured local POC results
 
-Environment: macOS arm64, Docker Desktop 29.7.2, Temurin Java 25.0.3, local single-node Kafka and Redis with AOF. The machine was also running other containers, so throughput variance was high.
+Environment: macOS arm64, Docker Desktop 29.7.2, Temurin Java 25.0.3, local single-node Kafka 4.4.0 and Redis 7.4 with AOF. The machine was also running other containers, so throughput variance was high.
 
-| Metric | Target | Stage 2B measured |
+A 100,000-event run is dominated by the fixed 500 ms window and projection drain, so the gate is measured with 1,000,000 unique events per run. Each run starts with an empty Redis and produces 10,000,000 expected points.
+
+| Metric | Target | Optimized Stage 2B |
 |---|---:|---:|
-| Producer-acked unique events/s | — | 51,084.56–92,933.16 |
-| Two-hop Kafka end-to-end unique events/s | 100,000 | **60,311.12 best**; repeated runs 34,989.60–60,311.12 |
-| Final reviewed-config run | — | 50,503.00 events/s, p95 2.45 ms |
-| Leaderboard p95 | about 5 ms | 1.07–2.45 ms post-drain |
-| Correct points | 1,000,000 | passed on all four runs |
-| Duplicate replay | no extra points | passed; 3 unique invoices = 30 points, resend produced no delta |
-| Restart dedupe | no extra points | passed; pre-restart invoice replayed after 36 s state restore, no new delta |
+| Producer-acked unique events/s | — | 116,708.38–135,115.94 |
+| End-to-end unique events/s (1M per run) | 100,000 | **102,541.84 / 120,862.70 / 122,030.32** |
+| Leaderboard p95 | about 5 ms | 1.28–3.00 ms post-drain |
+| Correct points | 10,000,000 | passed on all 3 runs |
+| Duplicate replay | no extra points | passed; duplicate batch replay produced no delta |
+| Restart dedupe | no extra points | passed; 3M-key store restored in 42 s, replay produced no delta, a fresh invoice still awarded 10 points |
 | JUnit 5 | — | 23/23 passed |
 
-Stage 2B runs measured 34,989.60 / 56,890.97 / 60,311.12 events/s before the final `read_committed` change; the final reviewed config measured 50,503.00 events/s with p95 2.45 ms. The 36-second restore figure is one local restart with about 300k invoice keys, not a production SLO. The p95 is still a post-drain sequential read, not an SLO proof under concurrent load. The **100k/s gate remains unmet**; per-invoice RocksDB work, window punctuation, one extra Kafka hop and a shared host are the visible costs.
+All three optimized runs exceeded 100k unique events/s end-to-end. During the producer phase the Streams topology trailed by 100k–161k events and then drained at 125k–187k events/s, so the measured result is limited by concurrent producer/host contention rather than a hard pipeline ceiling. An earlier backlog-only run with Kafka 4.1.0 and the 100 ms commit interval processed and applied 1M queued events at about 167k events/s.
+
+Tuning history on the same code path: Kafka 4.1.0 broker crashed the Streams client with KAFKA-19888; Kafka 4.4.0 fixed it. A 100 ms Streams commit interval measured 102,734.92 / 122,299.60 / 119,156.55 events/s; 500 ms measured 126,016.29 / 126,000.46 / 116,491.17 events/s and was kept. Twelve Streams threads measured 103,507.25 / 120,175.13 events/s and was rejected. The dedupe Bloom cache was kept because it removes a RocksDB read per first-seen invoice; its effect is largest when the store has millions of keys.
+
+The p95 is a post-drain sequential read, not measured under concurrent leaderboard load. The 15-minute sustained gate and 1,000 reads/s latency gate from the roadmap are **not** proven by these short runs; what is proven is that three independent 1M-event runs crossed 100k/s with exact point totals and no duplicate effects.
 
 Full machine-readable output: `docs/benchmark-results.json`.
 
 ### Remaining bottlenecks and next scaling steps
 
-- The dedupe store has no retention window. At 1M/s a day of invoice IDs is 86.4 billion keys; the store needs a documented business TTL or an external ledger before claiming that scale.
+- The dedupe store has no retention window. At 1M/s a day of invoice IDs is 86.4 billion keys; the store needs a documented business TTL or an external ledger before claiming that scale. The local 3M-key store used about 70 MB on disk.
+- Each Streams task keeps an 8 MB Bloom filter and rebuilds it by scanning the store on startup; restore time grows with state size (42 s for 3M keys locally).
 - `selectKey(companyId)` does not insert a repartition topic in this POC, so one company's deltas can be spread across input partitions. A production projector should consume a company-keyed topic.
 - The aggregator scans its RocksDB window store every 250 ms and emits from wall-clock punctuation. Late events are still counted, but they can be emitted after their nominal window.
 - Kafka EOS covers offsets, state and delta output only. Redis application is idempotent but not transactional; the delta Set grows with every delta and only pending markers have a TTL.
-- The local producer, application, Redis and unrelated containers share CPU. Twelve partitions and six Streams threads are a Stage 2 POC choice, not a 1M/s design.
+- The local producer, application, Redis and unrelated containers share CPU. Twelve partitions and six Streams threads are a Stage 2 POC choice, not a 1M/s design. A 15-minute sustained run, concurrent-read p95, freshness and failover drills remain open.
 
 Stage 3 scaling steps — larger partition counts, partitioned exact state with expiry, repartition/coalescing, dedicated leaderboard infrastructure and a 1M/s capacity run — are in `DEEP_RESEARCH_1M_EVENTS_ARCHITECTURE.md` and `docs/roadmap/1m-events-roadmap.md`.
 

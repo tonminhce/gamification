@@ -39,11 +39,13 @@ Mỗi stage phải có **exit criteria đo được**. Không tăng partition, c
 
 ## Stage 2 — 300k events/s và tách correctness state
 
-**Trạng thái:** Stage 2A và Stage 2B đã code xong; gate 300k/s chưa đạt. Pipeline hiện là `invoice-events → Kafka Streams dedupe/aggregate 500 ms → company-reward-deltas → leaderboard projector → Redis`. Exact invoice dedupe nằm trong RocksDB state store có changelog, không còn Redis Set. Benchmark Stage 2B: best 60.311,12 events/s end-to-end, bốn run 34.989,60–60.311,12, p95 1,07–2,45 ms post-drain; final config 50.503,00 events/s. Replay sau restart không tạo delta mới; restore ~300k keys mất 36 giây trên máy local.
+**Trạng thái:** Stage 2A và Stage 2B đã code xong. Pipeline hiện là `invoice-events → Kafka Streams dedupe/aggregate 500 ms → company-reward-deltas → leaderboard projector → Redis`. Exact invoice dedupe nằm trong RocksDB state store có changelog, có Bloom negative cache; không còn Redis Set. Sau tối ưu, ba run 1.000.000 event liên tiếp đạt **102.541,84 / 120.862,70 / 122.030,32 events/s end-to-end**, p95 1,28–3,00 ms post-drain, đúng 10.000.000 điểm mỗi run. Replay sau restart không tạo delta mới; state 3M keys restore mất 42 giây. Gate 300k/s chưa đạt; gate 100k/s mới đạt cho run ngắn 1M event, chưa phải 15 phút sustained.
 
-**Đã làm:** topic delta, Streams `exactly_once_v2`, RocksDB dedupe + changelog, window 500 ms, projector `read_committed`, batch Lua với delta Set và PENDING marker, 23 test pass.
+**Đã làm:** topic delta, Streams `exactly_once_v2`, RocksDB dedupe + changelog + Bloom filter, window 500 ms, commit interval 500 ms, projector `read_committed`, batch Lua với delta Set và PENDING marker, 23 test pass, broker Kafka 4.4.0 (fix KAFKA-19888), Streams start sau khi topic được tạo.
 
-**Chưa làm:** 64 partitions/RF3, `deltaId` deterministic, repartition topic theo `companyId`, retention/expiry cho dedupe store, dedicated Redis, outbox, chaos test, rebuild drill, capacity gate 300k/s.
+**Chưa làm:** 64 partitions/RF3, `deltaId` deterministic, repartition topic theo `companyId`, retention/expiry cho dedupe store, dedicated Redis, outbox, chaos test, rebuild drill, capacity gate 300k/s, soak 15 phút và p95 dưới concurrent read.
+
+**Đã đo và loại:** 100 ms commit interval (102,7k/122,3k/119,2k), 12 Streams threads (103,5k/120,2k, p95 tệ hơn); 500 ms commit + 6 threads được giữ.
 
 ### Công việc
 

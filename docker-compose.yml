@@ -1,6 +1,6 @@
 services:
   kafka:
-    image: apache/kafka:4.1.0
+    image: apache/kafka:4.4.0
     container_name: einvoice-poc-kafka
     ports:
       - "${KAFKA_PORT:-9092}:19092"

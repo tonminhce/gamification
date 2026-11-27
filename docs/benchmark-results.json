@@ -240,6 +240,99 @@
       "note": "Best 60,311.12 events/s on a shared host; p95 is a post-drain sequential read. Dedupe store has no retention policy and deltas are not repartitioned by company."
     }
   },
+  "stage2BOptimized": {
+    "measuredAt": "2026-11-27T09:24:19Z",
+    "environment": {
+      "kafka": "4.4.0 single node, 12 partitions",
+      "redis": "7.4 single node with AOF",
+      "note": "Broker upgraded from 4.1.0 because KAFKA-19888 (negative coordinator histogram) shut down the Streams client. Fresh broker and state before the three final runs."
+    },
+    "configuration": {
+      "totalUniqueEventsPerRun": 1000000,
+      "companyCount": 20,
+      "producerKey": "invoiceId",
+      "streamsThreads": 6,
+      "commitIntervalMs": 500,
+      "invoiceDedupe": "RocksDB store plus in-heap Bloom negative cache (4M expected keys, ~8 MB per task)",
+      "window": "500 ms event-time, 250 ms wall-clock punctuation",
+      "projector": "12 batch listeners, isolation.level=read_committed"
+    },
+    "finalRuns": [
+      {
+        "runId": "DIRECT-1795771433633",
+        "producerAckedEventsPerSecond": 116708.38,
+        "endToEndEventsPerSecond": 102541.84,
+        "leaderboardP95Ms": 1.66,
+        "pointsAtProducerEnd": 8474350,
+        "backlogEventsAtProducerEnd": 152565,
+        "backlogDrainEventsPerSecond": 128882.66,
+        "expectedPoints": 10000000,
+        "observedPoints": 10000000
+      },
+      {
+        "runId": "DIRECT-1795771446904",
+        "producerAckedEventsPerSecond": 134959.86,
+        "endToEndEventsPerSecond": 120862.70,
+        "leaderboardP95Ms": 3.00,
+        "pointsAtProducerEnd": 8386770,
+        "backlogEventsAtProducerEnd": 161323,
+        "backlogDrainEventsPerSecond": 186664.39,
+        "expectedPoints": 10000000,
+        "observedPoints": 10000000
+      },
+      {
+        "runId": "DIRECT-1795771459046",
+        "producerAckedEventsPerSecond": 135115.94,
+        "endToEndEventsPerSecond": 122030.32,
+        "leaderboardP95Ms": 1.28,
+        "pointsAtProducerEnd": 9004000,
+        "backlogEventsAtProducerEnd": 99600,
+        "backlogDrainEventsPerSecond": 125498.73,
+        "expectedPoints": 10000000,
+        "observedPoints": 10000000
+      }
+    ],
+    "bestRun": {
+      "runId": "DIRECT-1795771459046",
+      "endToEndEventsPerSecond": 122030.32,
+      "leaderboardP95Ms": 1.28
+    },
+    "tuningRuns": {
+      "commitInterval100ms": [
+        {"runId": "DIRECT-1795770620789", "producerAckedEventsPerSecond": 145778.17, "endToEndEventsPerSecond": 102734.92, "leaderboardP95Ms": 2.06},
+        {"runId": "DIRECT-1795770633862", "producerAckedEventsPerSecond": 189696.42, "endToEndEventsPerSecond": 122299.60, "leaderboardP95Ms": 1.20},
+        {"runId": "DIRECT-1795770645341", "producerAckedEventsPerSecond": 160687.70, "endToEndEventsPerSecond": 119156.55, "leaderboardP95Ms": 1.40}
+      ],
+      "commitInterval500msNoBloom": [
+        {"runId": "DIRECT-1795770714828", "producerAckedEventsPerSecond": 178378.34, "endToEndEventsPerSecond": 126016.29, "leaderboardP95Ms": 1.53},
+        {"runId": "DIRECT-1795770726257", "producerAckedEventsPerSecond": 161037.32, "endToEndEventsPerSecond": 126000.46, "leaderboardP95Ms": 1.87},
+        {"runId": "DIRECT-1795770737814", "producerAckedEventsPerSecond": 157194.42, "endToEndEventsPerSecond": 116491.17, "leaderboardP95Ms": 2.78}
+      ],
+      "streamsThreads12": [
+        {"runId": "DIRECT-1795770796070", "producerAckedEventsPerSecond": 117966.42, "endToEndEventsPerSecond": 103507.25, "leaderboardP95Ms": 2.20},
+        {"runId": "DIRECT-1795770810236", "producerAckedEventsPerSecond": 131611.05, "endToEndEventsPerSecond": 120175.13, "leaderboardP95Ms": 3.28}
+      ],
+      "backlogOnlyDrain": {
+        "events": 1000000,
+        "seconds": 6,
+        "eventsPerSecond": 166666,
+        "note": "Earlier backlog-only run with Kafka 4.1.0 and the 100 ms default commit interval, after Streams restart; no producer competition."
+      }
+    },
+    "correctness": {
+      "duplicateReplay": "3 processed invoice IDs replayed: delta offsets 22479 → 22479, points unchanged at 10,000,000",
+      "restartReplay": "3M-key dedupe store restored in 42 s; pre-restart invoice replayed: delta offsets 28036 → 28036, points unchanged",
+      "freshInvoiceAfterRestart": "POST-OPT-1 awarded 10 points",
+      "junitTests": "23 passed"
+    },
+    "targetAssessment": {
+      "oneHundredThousandEventsPerSecondMet": true,
+      "runsAboveOneHundredThousand": "3 of 3 one-million-event runs",
+      "fifteenMinuteSustainedGateMet": false,
+      "p95MeasuredUnderLoad": false,
+      "note": "Short 1M-event runs cross 100k/s end-to-end with exact points; the roadmap's 15-minute sustained run, concurrent-read p95 and failover drills are not tested. A 100k-event run is not a valid gate because fixed window/drain latency dominates it."
+    }
+  },
   "baselineBeforeOptimization": {
     "endToEndEventsPerSecond": 5602.61,
     "leaderboardP95Ms": 5.051,

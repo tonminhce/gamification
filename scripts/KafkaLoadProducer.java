@@ -75,6 +75,7 @@ public class KafkaLoadProducer {
             }
         }
         long producerEnd = System.nanoTime();
+        long pointsAtProducerEnd = totalPoints(httpClient, mapper, api);
 
         long expectedPoints = total * 10L;
         long deadline = System.nanoTime() + Duration.ofSeconds(60).toNanos();
@@ -104,6 +105,8 @@ public class KafkaLoadProducer {
 
         double producerSeconds = (producerEnd - producerStart) / 1_000_000_000.0;
         double endToEndSeconds = (endToEndEnd - producerStart) / 1_000_000_000.0;
+        double drainSeconds = (endToEndEnd - producerEnd) / 1_000_000_000.0;
+        long backlogAtProducerEnd = (expectedPoints - pointsAtProducerEnd) / 10L;
         double p95 = latencies.get((int) Math.ceil(latencies.size() * 0.95) - 1);
 
         System.out.println(mapper.writerWithDefaultPrettyPrinter().writeValueAsString(new Result(
@@ -114,7 +117,10 @@ public class KafkaLoadProducer {
                 round(total / endToEndSeconds),
                 round(p95),
                 expectedPoints,
-                observedPoints
+                observedPoints,
+                pointsAtProducerEnd,
+                backlogAtProducerEnd,
+                backlogAtProducerEnd > 0 ? round(backlogAtProducerEnd / drainSeconds) : null
         )));
     }
 
@@ -151,7 +157,10 @@ public class KafkaLoadProducer {
             double directKafkaEndToEndEventsPerSecond,
             double leaderboardP95Ms,
             long expectedPoints,
-            long observedPoints
+            long observedPoints,
+            long pointsAtProducerEnd,
+            long backlogEventsAtProducerEnd,
+            Double backlogDrainEventsPerSecond
     ) {
     }
 }

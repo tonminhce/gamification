@@ -111,7 +111,7 @@ Repeating the same operation has the same effect as performing it once.
 Kafka retries, producer retries, user retries, and batch redelivery can all repeat `INV-1001`.
 
 **Where is it implemented?**  
-`src/main/java/com/vnpt/einvoice/gamification/streams/DedupeProcessor.java` checks and writes `invoiceId` in the persistent RocksDB `invoice-dedupe-store`; the state is changelog-backed and committed with the same Streams transaction as the emitted delta. The projector separately deduplicates delta IDs in `einv:processed-deltas`. The topology test and live restart replay are in `src/test/java/com/vnpt/einvoice/gamification/streams/RewardTopologyTest.java`.
+`src/main/java/com/vnpt/einvoice/gamification/streams/DedupeProcessor.java` checks an in-heap Bloom filter and then the persistent RocksDB `invoice-dedupe-store`; the state is changelog-backed and committed with the same Streams transaction as the emitted delta. The projector separately deduplicates delta IDs in `einv:processed-deltas`. The topology test and live restart replay are in `src/test/java/com/vnpt/einvoice/gamification/streams/RewardTopologyTest.java`.
 
 **Interviewer questions**
 
@@ -120,7 +120,7 @@ Kafka retries, producer retries, user retries, and batch redelivery can all repe
 - What if the same invoice ID arrives for another company?
 
 **Senior answer**  
-“`invoiceId` is the business identity; `eventId` changes on every publish. The current POC keeps keys without a TTL because an old duplicate must never award again, and the state store is restored from the changelog after a restart. The cost is unbounded storage — at 1M/s that is 86.4 billion IDs per day, so production needs a documented retention window or an external ledger. A TTL is acceptable only if the business explicitly accepts re-award after expiry. If the same invoice ID arrives for another company, the first claim wins; the second is treated as a duplicate and is not awarded. That is correct for an invoice identity but should be alerted as a data-quality signal.”
+“`invoiceId` is the business identity; `eventId` changes on every publish. The current POC keeps keys without a TTL because an old duplicate must never award again, and the state store is restored from the changelog after a restart. The Bloom filter only avoids a RocksDB read for first-seen invoices; a filter hit still checks the store, so it can produce false positives but never false negatives. The cost is unbounded storage — at 1M/s that is 86.4 billion IDs per day, so production needs a documented retention window or an external ledger. A TTL is acceptable only if the business explicitly accepts re-award after expiry. If the same invoice ID arrives for another company, the first claim wins; the second is treated as a duplicate and is not awarded. That is correct for an invoice identity but should be alerted as a data-quality signal.”
 
 ## 7. Atomicity
 
@@ -240,7 +240,7 @@ Streams `exactly_once_v2`, window aggregation and the delta projector: `src/main
 - What is the trade-off?
 
 **Senior answer**  
-“Batch commits, asynchronous publishing, producer batching, window aggregation and one Redis Lua call per projector batch raised the direct unique-event result from 5,603 events/s in the earliest per-event pipeline to a 60,311 events/s best Stage 2B run; the final reviewed config measured 50,503 events/s. A top-N cache could reduce read latency further, but it introduces staleness and invalidation work. I would only add it after measuring a read bottleneck.”
+“Batch commits, asynchronous publishing, producer batching, window aggregation and one Redis Lua call per projector batch raised the direct unique-event result from 5,603 events/s in the earliest per-event pipeline to 102,541–122,030 events/s end-to-end on three 1,000,000-event Stage 2B runs. I use 1M-event runs for the gate because a 100k-event run is dominated by the fixed window and drain latency. A top-N cache could reduce read latency further, but it introduces staleness and invalidation work. I would only add it after measuring a read bottleneck.”
 
 ## 13. p95 Latency
 
@@ -260,7 +260,7 @@ The target is approximately 5 ms p95, not just a good average.
 - What creates tail latency?
 
 **Senior answer**  
-“The final Stage 2B run measured 2.45 ms p95 after ingest drained, across runs 1.07–2.45 ms; this is not measured under concurrent load, so it is not a production guarantee. Tail latency can come from JVM pauses, GC, Redis contention, network scheduling, Kafka rebalances, or the 500 ms window flush. A real test needs production-like data, sustained load, multiple runs, and percentile reporting under concurrent reads and writes.”
+“The optimized Stage 2B runs measured 1.28–3.00 ms p95 after ingest drained across three 1M-event runs; this is not measured under concurrent load, so it is not a production guarantee. Tail latency can come from JVM pauses, GC, Redis contention, network scheduling, Kafka rebalances, or the 500 ms window flush. A real test needs production-like data, sustained load, multiple runs, and percentile reporting under concurrent reads and writes.”
 
 ## 14. Horizontal Scaling
 
@@ -334,22 +334,22 @@ Build a small, reliable event-driven POC that separates invoice issuance from re
 
 ## Action
 
-I used one Spring Boot application with a two-stage reward pipeline. The invoice API supports single and batch requests and queues `INVOICE_ISSUED` events asynchronously, keyed by `invoiceId`. A Kafka Streams topology with `exactly_once_v2` claims each invoice in a changelog-backed RocksDB store, drops duplicates, re-keys by `companyId`, and aggregates points in 500 ms windows. It emits one `CompanyRewardDelta` per company and window to a second Kafka topic. A separate projector consumes that topic with `read_committed`, deduplicates delta IDs, coalesces by company, and applies one `ZINCRBY` per company using a recoverable Lua batch. Leaderboard reads use descending Sorted Set ranges, score lookups, and competition-rank counting.
+I used one Spring Boot application with a two-stage reward pipeline. The invoice API supports single and batch requests and queues `INVOICE_ISSUED` events asynchronously, keyed by `invoiceId`. A Kafka Streams topology with `exactly_once_v2` claims each invoice in a changelog-backed RocksDB store with a Bloom negative cache, drops duplicates, re-keys by `companyId`, and aggregates points in 500 ms windows. It commits state and output every 500 ms and emits one `CompanyRewardDelta` per company and window to a second Kafka topic. A separate projector consumes that topic with `read_committed`, deduplicates delta IDs, coalesces by company, and applies one `ZINCRBY` per company using a recoverable Lua batch. Leaderboard reads use descending Sorted Set ranges, score lookups, and competition-rank counting.
 
-I tested discount boundaries, duplicate delivery, topology dedupe and windowing, DLT filtering, delta projector dedupe/aggregation, malformed REST input, an application restart with a replayed invoice, and the full two-hop flow. I also ran four 100,000-event direct Kafka benchmarks and verified the exact 1,000,000 expected points every time.
+I tested discount boundaries, duplicate delivery, topology dedupe and windowing, DLT filtering, delta projector dedupe/aggregation, malformed REST input, an application restart with a replayed invoice, and the full two-hop flow. I tuned commit interval and Streams threads against measured runs, upgraded the broker to Kafka 4.4.0 after a 4.1.0 transaction-coordinator bug shut down the client, and ran three 1,000,000-event direct Kafka benchmarks plus a backlog-only drain test.
 
 ## Result
 
-On the local Docker POC, the Stage 2B runs measured 34,989.60 to 60,311.12 unique end-to-end events/s; the final reviewed config measured 50,503.00 events/s. Leaderboard p95 was 1.07–2.45 ms post-drain. All four runs produced exactly 1,000,000 points. Three unique invoices plus a resend produced 30 points and no extra delta, and replaying a pre-restart invoice produced no new delta after a 36-second state restore.
+On the local Docker POC, the optimized Stage 2B runs measured 102,541.84, 120,862.70 and 122,030.32 unique end-to-end events/s — all above 100k. Leaderboard p95 was 1.28–3.00 ms post-drain, and every run produced exactly 10,000,000 points. Duplicate replay produced no delta. The 3M-key dedupe store restored in 42 seconds; a pre-restart invoice produced no new delta, and a fresh invoice still awarded 10 points.
 
-These are local POC results, not VNPT production measurements. The 100,000 events/s gate is still unmet, the dedupe store has no retention policy, and one company's deltas are not repartitioned into a single partition. Stage 3 addresses partition scaling, exact-state expiry and a 1M/s capacity run.
+These are local POC results, not VNPT production measurements. The roadmap's 15-minute sustained gate, concurrent-read p95, freshness and failover drills are not tested. The dedupe store has no retention policy, and one company's deltas are not repartitioned into a single partition. Stage 3 addresses partition scaling, exact-state expiry and a 1M/s capacity run.
 
 ## Natural 1–2 minute English interview explanation
 
 “I built a small VNPT e-Invoice gamification POC to practice the backend design rather than claim a production system. The invoice API validates the request, queues an `INVOICE_ISSUED` event asynchronously, and returns 202 with publishing status, so reward processing does not block invoice issuance.
 
-The reward pipeline has two stages. A Kafka Streams topology uses a partitioned RocksDB state store to deduplicate invoice IDs, aggregates points over 500 ms windows, and publishes company deltas to a second Kafka topic with exactly-once processing. A separate projector reads that topic with `read_committed`, deduplicates delta IDs, coalesces by company, and updates the leaderboard with one atomic Lua call per batch. That handles Kafka redelivery, producer retries, restarts, and concurrent consumers without double awards.
+The reward pipeline has two stages. A Kafka Streams topology uses a partitioned RocksDB state store and a Bloom negative cache to deduplicate invoice IDs, aggregates points over 500 ms windows, and publishes company deltas to a second Kafka topic with exactly-once processing. A separate projector reads that topic with `read_committed`, deduplicates delta IDs, coalesces by company, and updates the leaderboard with one atomic Lua call per batch. That handles Kafka redelivery, producer retries, restarts, and concurrent consumers without double awards.
 
 Leaderboard reads use Redis Sorted Sets directly, so top-N, points, and rank do not require scanning a database. Discounts are calculated from the current score.
 
-I verified duplicate and restart behavior and ran four 100,000-event direct Kafka benchmarks. The best Stage 2B run measured 60,311 unique end-to-end events per second, the final config measured 50,503, and p95 was 1.07–2.45 ms post-drain. The 100k gate was not met, so I would not present that as production capacity. The next step is Stage 3: larger partition counts, exact-state retention and a measured 1M/s capacity run.”
+I verified duplicate and restart behavior and ran three 1,000,000-event direct Kafka benchmarks. The runs measured 102,541, 120,863 and 122,030 unique end-to-end events per second, all above the 100k gate, with p95 between 1.28 and 3.00 ms post-drain and exact point totals. I would still not present that as 15-minute sustained production capacity: the sustained gate, concurrent-read latency and failover drills are the next measurements. Stage 3 then targets partition scaling, exact-state retention and a measured 1M/s capacity run.”

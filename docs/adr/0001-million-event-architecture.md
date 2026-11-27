@@ -16,18 +16,20 @@ Kiến trúc “mỗi invoice → một Lua script → một Redis marker” ch�
 Đã có trong POC:
 
 - Hai hop `invoice-events → company-reward-deltas → Redis`, Streams `exactly_once_v2`.
-- Dedupe `invoiceId` trong persistent RocksDB store + changelog; đã kiểm chứng replay sau restart không tạo delta mới.
+- Dedupe `invoiceId` trong persistent RocksDB store + changelog, có Bloom negative cache; đã kiểm chứng replay sau restart không tạo delta mới.
 - Window aggregation 500 ms, delta output có `deltaId`, `deltaPoints`, `windowStart`, `windowEnd`, `schemaVersion`.
 - Projector `isolation.level=read_committed`, batch Lua với delta Set, PENDING marker và TTL.
-- 23 JUnit 5 test pass; bốn run 100k event đều ra đúng 1.000.000 điểm; best 60.311,12 events/s end-to-end, p95 1,07–2,45 ms post-drain.
+- Commit interval 500 ms, 6 Streams threads; 12 threads và 100 ms commit bị loại sau đo.
+- Broker Kafka 4.4.0 thay 4.1.0 vì KAFKA-19888; Streams chỉ start sau khi topic được tạo.
+- 23 JUnit 5 test pass; ba run 1.000.000 event đạt 102.541,84 / 120.862,70 / 122.030,32 events/s end-to-end, p95 1,28–3,00 ms post-drain, đúng 10.000.000 điểm; duplicate và restart replay không tăng điểm.
 
 Chưa đạt hoặc chưa làm so với ADR:
 
 - Chưa lên 64 partitions/RF3; POC dùng 12 partitions, RF1.
 - `selectKey(companyId)` chưa tạo repartition topic, nên delta của một company có thể nằm nhiều partition.
 - `deltaId` chứa UUID, chưa deterministic theo window/company.
-- Dedupe store chưa có retention/TTL, chưa có rebuild drill hay chaos test.
-- Chưa đạt 100k/s ổn định, càng chưa có capacity run 300k/s hay 1M/s.
+- Dedupe store chưa có retention/TTL, chưa có rebuild drill hay chaos test; Bloom 4M keys/task là cấu hình POC.
+- Chưa chạy gate 15 phút sustained, p95 dưới concurrent read, freshness, failover; chưa có capacity run 300k/s hay 1M/s.
 
 ## Decision
 

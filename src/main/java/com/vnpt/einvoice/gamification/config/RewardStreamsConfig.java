@@ -8,6 +8,7 @@ import org.apache.kafka.streams.KafkaStreams;
 import org.apache.kafka.streams.StreamsConfig;
 import org.apache.kafka.streams.Topology;
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.boot.ApplicationRunner;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 
@@ -25,18 +26,20 @@ public class RewardStreamsConfig {
         return RewardTopology.build(sourceTopic, deltaTopic, dltTopic);
     }
 
-    @Bean(initMethod = "start", destroyMethod = "close")
+    @Bean(destroyMethod = "close")
     KafkaStreams rewardStreams(
             Topology rewardTopology,
             @Value("${spring.kafka.bootstrap-servers}") String bootstrapServers,
             @Value("${app.streams.application-id}") String applicationId,
             @Value("${app.streams.threads}") int threads,
+            @Value("${app.streams.commit-interval-ms}") long commitIntervalMs,
             @Value("${app.streams.state-dir}") String stateDir
     ) {
         Properties properties = new Properties();
         properties.put(StreamsConfig.APPLICATION_ID_CONFIG, applicationId);
         properties.put(StreamsConfig.BOOTSTRAP_SERVERS_CONFIG, bootstrapServers);
         properties.put(StreamsConfig.PROCESSING_GUARANTEE_CONFIG, StreamsConfig.EXACTLY_ONCE_V2);
+        properties.put(StreamsConfig.COMMIT_INTERVAL_MS_CONFIG, commitIntervalMs);
         properties.put(StreamsConfig.REPLICATION_FACTOR_CONFIG, 1);
         properties.put(StreamsConfig.NUM_STREAM_THREADS_CONFIG, threads);
         properties.put(StreamsConfig.STATE_DIR_CONFIG, stateDir);
@@ -51,5 +54,11 @@ public class RewardStreamsConfig {
                 "all"
         );
         return new KafkaStreams(rewardTopology, properties);
+    }
+
+    @Bean
+    ApplicationRunner startRewardStreams(KafkaStreams rewardStreams) {
+        // Topic beans are created during context refresh; starting in the bean factory races MissingSourceTopicException on a fresh broker.
+        return args -> rewardStreams.start();
     }
 }
