@@ -26,6 +26,16 @@ public class KafkaConfig {
     }
 
     @Bean
+    org.apache.kafka.clients.admin.NewTopic companyRewardDeltasTopic(
+            @Value("${app.kafka.delta-topic}") String topic
+    ) {
+        return TopicBuilder.name(topic)
+                .partitions(12)
+                .replicas(1)
+                .build();
+    }
+
+    @Bean
     org.apache.kafka.clients.admin.NewTopic invoiceEventsDltTopic(
             @Value("${app.kafka.dlt-topic}") String topic
     ) {
@@ -43,6 +53,18 @@ public class KafkaConfig {
     @Bean
     KafkaTemplate<String, InvoiceIssuedEvent> invoiceKafkaTemplate(
             ProducerFactory<String, InvoiceIssuedEvent> producerFactory
+    ) {
+        return new KafkaTemplate<>(producerFactory);
+    }
+
+    @Bean
+    ProducerFactory<String, Object> objectProducerFactory(KafkaProperties properties) {
+        return new DefaultKafkaProducerFactory<>(properties.buildProducerProperties());
+    }
+
+    @Bean
+    KafkaTemplate<String, Object> objectKafkaTemplate(
+            ProducerFactory<String, Object> producerFactory
     ) {
         return new KafkaTemplate<>(producerFactory);
     }

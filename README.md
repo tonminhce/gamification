@@ -1,4 +1,4 @@
-# VNPT e-Invoice Gamification POC — Stage 1
+# VNPT e-Invoice Gamification POC — Stage 2A
 
 A single Spring Boot application that simulates invoice issuance, publishes `INVOICE_ISSUED` events to Kafka, awards points idempotently through Redis Lua, and exposes a real-time company leaderboard.
 
@@ -11,11 +11,12 @@ flowchart LR
     C[Client / curl] -->|single hoặc batch| API[Spring Boot REST API]
     API -->|KafkaTemplate.send| KP[Kafka Producer]
     KP -->|acks=all| KT[(Kafka: invoice-events, 12 partitions)]
-    KT -->|consumer group: einvoice-gamification| KC[Spring Kafka batch consumer]
-    KC -->|one Lua call per Kafka batch| LUA[Redis Lua: apply_reward_batch]
-    LUA -->|SMISMEMBER / SADD| ID[(Redis Set: processed-invoices)]
-    LUA -->|PENDING / APPLIED| BM[(Redis batch markers)]
-    LUA -->|ZINCRBY per company| ZS[(Redis Sorted Set: leaderboard)]
+    KT -->|consumer group: einvoice-gamification| KC[Invoice reward processor]
+    KC -->|claim + aggregate| CA[Redis claim Lua]
+    KC -->|publish per-company delta| KD[(Kafka: company-reward-deltas)]
+    KD --> LP[Leaderboard projector]
+    LP -->|idempotent delta batch| DL[Redis delta Lua]
+    DL -->|ZINCRBY per company| ZS[(Redis Sorted Set: leaderboard)]
     API -->|GET endpoints| LS[Leaderboard Service]
     LS -->|ZREVRANGE / ZSCORE / ZCOUNT| ZS
     LS -->|points-to-discount rules| D[Discount calculation]
@@ -27,9 +28,10 @@ flowchart LR
 2. The producer uses `companyId` as the Kafka key and returns `202 Accepted` with status `PUBLISHING` after queuing the asynchronous send.
 3. Kafka stores events across 12 partitions. A consumer group processes partitions independently.
 4. The consumer validates the whole Kafka batch and creates a deterministic batch ID from topic, partition and offset range.
-5. One Lua script checks invoice IDs with `SMISMEMBER`, claims new IDs with chunked `SADD`, aggregates points per company, writes a recoverable `PENDING` batch marker, applies `ZINCRBY`, and finalizes the marker as `A`.
-6. The batch listener returns only after the script succeeds. Spring Kafka then commits offsets. A failure redelivers the same batch; the batch marker and processed Set make the retry safe.
-7. Leaderboard endpoints read Redis Sorted Sets directly. Discounts are calculated from current points.
+5. The invoice processor claims IDs with a recoverable Redis Lua batch, aggregates points per company, publishes one `CompanyRewardDelta` per company to Kafka, then deletes the claim marker.
+6. The leaderboard projector consumes the delta topic, checks/deduplicates delta IDs in Redis, coalesces by company, and applies `ZINCRBY` in one recoverable Lua batch.
+7. Batch offsets commit only after each listener succeeds. Failures redeliver; claim/delta markers and processed Sets make retries idempotent.
+8. Leaderboard endpoints read Redis Sorted Sets directly. Discounts are calculated from current points.
 
 ### Kafka event JSON
 
@@ -54,7 +56,9 @@ flowchart LR
 |---|---|---|
 | `einv:leaderboard` | Sorted Set | Member = `companyId`, score = total points |
 | `einv:processed-invoices` | Set | Exact invoice IDs already claimed |
-| `einv:reward-batch:{topic}:{partition}` | String JSON | `PENDING` recovery state or `A`, with TTL |
+| `einv:invoice-claim:{topic}:{partition}` | String JSON | Pending invoice claim with TTL |
+| `einv:processed-deltas` | Set | Company reward delta IDs already applied |
+| `einv:delta-batch:{topic}:{partition}` | String JSON | Pending leaderboard delta batch with TTL |
 
 Company points, rank, and discount are derived from the leaderboard; no duplicate company profile is stored.
 
@@ -63,11 +67,12 @@ Company points, rank, and discount are derived from the leaderboard; no duplicat
 - **At-least-once processing, not end-to-end exactly once.** Kafka can redeliver; Redis makes the business effect idempotent. No Kafka transactions or exactly-once claim are used.
 - **Asynchronous publish for ingress throughput.** The API returns after queuing the send instead of waiting for the broker. Delivery failures are logged and retries use the same `invoiceId`; production should add an outbox or delivery-status store if accepted requests must be durably retained.
 - **Batch acknowledgment.** Committing every record was measurably expensive. `AckMode.BATCH` commits after the whole listener batch succeeds. If event 50 fails, events 1–49 can be redelivered, but Lua returns duplicate for them.
-- **One Lua call per Kafka batch.** The script uses `SMISMEMBER` and chunked `SADD` instead of one Redis round trip per invoice, then performs one `ZINCRBY` per company.
-- **Recoverable per-partition marker.** The marker is stable across Kafka repolls, written before claims and score updates, and expires with a seven-day TTL. If the script fails midway, retry first completes the stored batch and then processes the current record list.
+- **Two-stage reward pipeline.** Invoice processing no longer writes the leaderboard. It publishes per-company deltas; a separate projector owns Redis Sorted Set updates.
+- **One Lua call per Kafka batch at each stage.** Invoice claims use `SMISMEMBER` and chunked `SADD`; the projector aggregates delta points per company and writes one `ZINCRBY` per company.
+- **Recoverable per-partition markers.** Both stages use stable per-partition marker keys with TTLs. A retry recovers the stored pending batch before processing the current record list.
 - **Minimal DLT.** Invalid event types or missing fields are published to `invoice-events.DLT`; valid records in the same batch are still processed. A failed DLT publish is retried rather than acknowledged.
 - **Infinite retry in the POC.** A persistent Redis outage blocks the affected partition instead of skipping data. Production should use bounded retries and alerting.
-- **Permanent processed Set.** Correct for this POC, but memory grows with invoice count. Stage 2 should move exact dedupe to a partitioned state store with a business retention window.
+- **Permanent processed Sets.** Invoice and delta Sets grow with cardinality. Stage 2B should move exact invoice dedupe to a partitioned state store with a business retention window.
 - **Redis AOF persistence.** Compose enables AOF with `appendfsync everysec` and a named volume. This is not HA and not a substitute for backups.
 - **Consistent competition ranks.** `ZREVRANGE WITHSCORES` returns sorted scores, and top-N ranks are calculated from adjacent equal scores. The company-rank endpoint uses `1 + ZCOUNT key (score +inf`, so equal scores share a rank. `ZREVRANK` is O(log N) but returns an ordinal position for ties, so it is not used for the public rank semantics.
 - **Twelve partitions.** This is the Stage 1 topology. Increasing to 24 consumers made the local benchmark worse because of CPU/context-switch overhead.
@@ -108,8 +113,10 @@ Company points, rank, and discount are derived from the leaderboard; no duplicat
     │   │   │   ├── PointsResponse.java
     │   │   │   └── RankResponse.java
     │   │   ├── config/KafkaConfig.java
-    │   │   ├── consumer/RewardConsumer.java
-    │   │   ├── event/InvoiceIssuedEvent.java
+    │   │   ├── consumer/InvoiceRewardProcessor.java
+    │   │   ├── event/
+    │   │   │   ├── CompanyRewardDelta.java
+    │   │   │   └── InvoiceIssuedEvent.java
     │   │   ├── exception/
     │   │   │   ├── ApiExceptionHandler.java
     │   │   │   ├── EventPublishException.java
@@ -120,20 +127,29 @@ Company points, rank, and discount are derived from the leaderboard; no duplicat
     │   │   ├── leaderboard/
     │   │   │   ├── CompanyController.java
     │   │   │   ├── DiscountService.java
+    │   │   │   ├── LeaderboardApplyService.java
     │   │   │   ├── LeaderboardController.java
+    │   │   │   ├── LeaderboardProjector.java
     │   │   │   └── LeaderboardService.java
-    │   │   └── reward/RewardService.java
+    │   │   └── reward/
+    │   │       ├── ClaimedCompanyDelta.java
+    │   │       ├── InvoiceClaimResult.java
+    │   │       └── InvoiceClaimService.java
     │   └── resources/
     │       ├── application.yml
-    │       └── scripts/apply_reward_batch.lua
+    │       └── scripts/
+    │           ├── apply_delta_batch.lua
+    │           └── claim_invoice_batch.lua
     └── test/java/com/vnpt/einvoice/gamification/
-        ├── consumer/RewardConsumerTest.java
+        ├── consumer/InvoiceRewardProcessorTest.java
         ├── exception/ApiExceptionHandlerTest.java
         ├── invoice/InvoiceEventPublisherTest.java
         ├── leaderboard/
         │   ├── DiscountServiceTest.java
+        │   ├── LeaderboardApplyServiceIntegrationTest.java
+        │   ├── LeaderboardProjectorTest.java
         │   └── LeaderboardServiceTest.java
-        └── reward/RewardServiceIntegrationTest.java
+        └── reward/InvoiceClaimServiceIntegrationTest.java
 ```
 
 ### Core implementation map
@@ -142,120 +158,20 @@ Company points, rank, and discount are derived from the leaderboard; no duplicat
 |---|---|
 | Producer settings and typed `KafkaTemplate` | `src/main/resources/application.yml`, `src/main/java/com/vnpt/einvoice/gamification/config/KafkaConfig.java` |
 | Single and batch asynchronous publishing | `src/main/java/com/vnpt/einvoice/gamification/invoice/InvoiceEventPublisher.java` |
-| Batch consumer and offset behavior | `src/main/java/com/vnpt/einvoice/gamification/consumer/RewardConsumer.java` |
-| Atomic batched reward update | `src/main/resources/scripts/apply_reward_batch.lua`, `src/main/java/com/vnpt/einvoice/gamification/reward/RewardService.java` |
+| Invoice claim and DLT | `src/main/java/com/vnpt/einvoice/gamification/consumer/InvoiceRewardProcessor.java` |
+| Exact invoice claim/aggregation | `src/main/resources/scripts/claim_invoice_batch.lua`, `src/main/java/com/vnpt/einvoice/gamification/reward/InvoiceClaimService.java` |
+| Leaderboard delta projector | `src/main/java/com/vnpt/einvoice/gamification/leaderboard/LeaderboardProjector.java`, `src/main/resources/scripts/apply_delta_batch.lua` |
 | Leaderboard, points, rank | `src/main/java/com/vnpt/einvoice/gamification/leaderboard/LeaderboardService.java` |
 | Discount tiers | `src/main/java/com/vnpt/einvoice/gamification/leaderboard/DiscountService.java` |
 | REST validation and errors | `src/main/java/com/vnpt/einvoice/gamification/exception/ApiExceptionHandler.java` |
-| Real Redis concurrency test | `src/test/java/com/vnpt/einvoice/gamification/reward/RewardServiceIntegrationTest.java` |
+| Redis claim/projector tests | `src/test/java/com/vnpt/einvoice/gamification/reward/InvoiceClaimServiceIntegrationTest.java`, `src/test/java/com/vnpt/einvoice/gamification/leaderboard/LeaderboardApplyServiceIntegrationTest.java` |
 
-### Reward Lua script
+### Stage 2A Lua scripts
 
-```lua
-local points = tonumber(ARGV[1])
-local markerTtl = tonumber(ARGV[2])
-if not points or points <= 0 or not markerTtl or markerTtl <= 0 then
-    return redis.error_reply('points and marker TTL must be positive numbers')
-end
+- `src/main/resources/scripts/claim_invoice_batch.lua`: exact invoice claim, company aggregation, recoverable claim marker.
+- `src/main/resources/scripts/apply_delta_batch.lua`: delta dedupe, company coalescing, leaderboard update and recovery.
 
-local function applyBatch(batch)
-    for startIndex = 1, #batch.invoiceIds, 1000 do
-        local chunk = {}
-        for index = startIndex, math.min(startIndex + 999, #batch.invoiceIds) do
-            table.insert(chunk, batch.invoiceIds[index])
-        end
-        redis.call('SADD', KEYS[3], unpack(chunk))
-    end
-
-    for _, company in ipairs(batch.companies) do
-        local scoreValue = redis.call('ZSCORE', KEYS[1], company.companyId)
-        local currentScore = scoreValue and tonumber(scoreValue) or 0
-        local scoreBefore = tonumber(company.scoreBefore)
-        local scoreAfter = scoreBefore + tonumber(company.delta)
-        if currentScore == scoreBefore then
-            redis.call('ZINCRBY', KEYS[1], company.delta, company.companyId)
-        elseif currentScore ~= scoreAfter then
-            return redis.error_reply('partial reward batch requires reconciliation')
-        end
-    end
-end
-
-local batchValue = redis.call('GET', KEYS[2])
-if batchValue == 'A' then
-    -- No pending work; the current retry can still contain new records.
-elseif batchValue then
-    local ok, decoded = pcall(cjson.decode, batchValue)
-    if not ok or type(decoded) ~= 'table' or decoded.state ~= 'PENDING' then
-        return redis.error_reply('reward batch marker is malformed')
-    end
-    applyBatch(decoded)
-    redis.call('SET', KEYS[2], 'A', 'EX', markerTtl)
-end
-
-local seen = {}
-local uniqueIds = {}
-local invoiceCompany = {}
-
-for index = 3, #ARGV, 2 do
-    local invoiceId = ARGV[index]
-    if not seen[invoiceId] then
-        seen[invoiceId] = true
-        table.insert(uniqueIds, invoiceId)
-        invoiceCompany[invoiceId] = ARGV[index + 1]
-    end
-end
-
-local newInvoiceIds = {}
-for startIndex = 1, #uniqueIds, 1000 do
-    local chunk = {}
-    for index = startIndex, math.min(startIndex + 999, #uniqueIds) do
-        table.insert(chunk, uniqueIds[index])
-    end
-    local members = redis.call('SMISMEMBER', KEYS[3], unpack(chunk))
-    for index, member in ipairs(members) do
-        if member == 0 then
-            table.insert(newInvoiceIds, chunk[index])
-        end
-    end
-end
-
-if #newInvoiceIds == 0 then
-    redis.call('SET', KEYS[2], 'A', 'EX', markerTtl)
-    return 0
-end
-
-local companies = {}
-local companyOrder = {}
-for _, invoiceId in ipairs(newInvoiceIds) do
-    local companyId = invoiceCompany[invoiceId]
-    local company = companies[companyId]
-    if not company then
-        local scoreValue = redis.call('ZSCORE', KEYS[1], companyId)
-        company = {
-            companyId = companyId,
-            delta = 0,
-            scoreBefore = scoreValue and tonumber(scoreValue) or 0
-        }
-        companies[companyId] = company
-        table.insert(companyOrder, companyId)
-    end
-    company.delta = company.delta + points
-end
-
-local companyList = {}
-for _, companyId in ipairs(companyOrder) do
-    table.insert(companyList, companies[companyId])
-end
-
-local batch = {
-    state = 'PENDING',
-    invoiceIds = newInvoiceIds,
-    companies = companyList
-}
-redis.call('SET', KEYS[2], cjson.encode(batch), 'EX', markerTtl)
-applyBatch(batch)
-redis.call('SET', KEYS[2], 'A', 'EX', markerTtl)
-return #newInvoiceIds```
+Both scripts are executed with `EVALSHA` and use one atomic execution per Kafka batch.
 
 ## Phase 3 — Local testing
 
@@ -450,7 +366,7 @@ export JAVA_HOME=$(/usr/libexec/java_home -v 25)
 mvn test
 ```
 
-Expected: **32 JUnit 5 tests**, 0 failures, 0 errors. The Redis integration test starts its own Redis container through Testcontainers and covers concurrent duplicates, a 5,000-event Lua batch, both partial-write recovery points, wrong key types and script-cache flush.
+Expected: **25 JUnit 5 tests**, 0 failures, 0 errors. Testcontainers covers invoice claim recovery/concurrency and delta projector dedupe/aggregation. Processor/projector tests cover Kafka handoff and DLT.
 
 ### 11. Run the performance benchmark
 
@@ -499,28 +415,29 @@ java -cp "target/classes:$(cat /tmp/gamification-classpath.txt)" \
 
 Environment: macOS arm64, Docker Desktop 29.7.2, Temurin Java 25.0.3, local single-node Kafka and Redis with AOF. The machine was also running other containers, so throughput variance was high.
 
-| Metric | Target | Stage 1 measured |
+| Metric | Target | Stage 2A measured |
 |---|---:|---:|
-| Producer-acked unique events/s | — | 103,273.31 best |
-| Direct Kafka end-to-end unique events/s | 100,000 | **88,647.90 best** |
-| Repeated final-config runs | 100,000 | 56,643.54–88,647.90 |
-| Leaderboard p95 | about 5 ms | 1.91–4.31 ms |
+| Producer-acked unique events/s | — | 98,231.42 |
+| Two-hop Kafka end-to-end unique events/s | 100,000 | **64,461.46** |
+| Leaderboard p95 | about 5 ms | 1.56 ms post-drain |
 | Correct points | 1,000,000 | passed |
-| Duplicate batch smoke | no extra points | passed; 2 invoices = 20 points |
-| Final reviewed-code run | — | 56,643.54 events/s, p95 1.92 ms |
+| Duplicate batch smoke | no extra points | passed; 2 unique invoices = 20 points |
+| Invoice claim Set | 2 IDs | passed |
+| Delta Set | 1 company delta | passed |
 
-The reported p95 is measured with 200 sequential leaderboard reads after the ingest has drained, not under concurrent load, so it is not a Stage 1 SLO proof. The **100k/s Stage 1 gate was not met consistently** on this shared machine. The previous 10k/s target was met at 11,513.81 events/s with 2.89 ms p95 before Stage 1 batching. The best observed Stage 1 result was about 7.7× the earlier optimized per-event pipeline, but this comparison conflates several tuning changes.
+Stage 2A adds one Kafka hop and synchronous delta publication per company, so this run is slower than the best Stage 1 direct result. The p95 is still a post-drain sequential read, not an SLO proof under concurrent load. The **100k/s gate remains unmet**.
 
 Full machine-readable output: `docs/benchmark-results.json`.
 
-### Likely bottlenecks and next scaling steps
+### Stage 2B and remaining bottlenecks
 
-- Exact dedupe still performs membership work for every invoice.
-- One Redis Set and one leaderboard ZSET remain hot data structures.
-- The local producer, application, Redis and many unrelated containers share CPU.
-- Twelve consumers are enough for Stage 1 but not a 1M/s design.
+- Invoice exact dedupe still uses a Redis Set rather than a partitioned Kafka Streams/RocksDB state store.
+- Delta publication is synchronous per company in this POC.
+- Delta volume is one record per company per invoice batch; a true high-throughput design should aggregate by time window before Kafka.
+- The local producer, application, Redis and unrelated containers share CPU.
+- Twelve consumers are enough for this intermediate stage, not for 1M/s.
 
-Stage 2 should introduce the reward-delta topic, partitioned exact state store, company repartition/coalescing and a dedicated leaderboard projector as described in `DEEP_RESEARCH_1M_EVENTS_ARCHITECTURE.md` and `docs/adr/0001-million-event-architecture.md`.
+Stage 2B should replace the Redis claim Set with the partitioned exact state store and add time-window aggregation before `company-reward-deltas`, as described in `DEEP_RESEARCH_1M_EVENTS_ARCHITECTURE.md` and `docs/adr/0001-million-event-architecture.md`.
 
 ## Validation and error behavior
 

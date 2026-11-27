@@ -9,7 +9,7 @@
 
 POC hiện tại đã chứng minh đường Java 25/Spring Boot 4 → Kafka → Redis Lua → Sorted Set hoạt động đúng và đạt khoảng 11,5k unique events/s end-to-end với leaderboard p95 2,89 ms trên máy local. Mục tiêu mới là 1 triệu events/s cho toàn bộ REST → Kafka → Redis, leaderboard p95 khoảng 5 ms, idempotency chính xác theo business window và cho phép scale-out.
 
-Kiến trúc “mỗi invoice → một Lua script → một Redis marker” chưa được chứng minh là phù hợp ở 1M/s. Stage 1 đã thay bằng batch API, 12 partitions và một Lua batch script dùng Redis Set; reward-delta topic/state store vẫn là Stage 2. Ở tốc độ đó, mỗi event vẫn cần exact lookup, marker state và thao tác cập nhật. Retention 24 giờ tạo ra 86,4 tỷ invoice IDs, còn Redis command execution vẫn tuần tự. Vì vậy cần thay đổi đơn vị xử lý, không chỉ tăng batch.
+Kiến trúc “mỗi invoice → một Lua script → một Redis marker” chưa được chứng minh là phù hợp ở 1M/s. Stage 1 đã thay bằng batch API, 12 partitions và một Lua batch script dùng Redis Set. Stage 2A đã thêm reward-delta topic và leaderboard projector; partitioned exact state store/time-window aggregation vẫn là Stage 2B. Ở tốc độ đó, mỗi event vẫn cần exact lookup, marker state và thao tác cập nhật. Retention 24 giờ tạo ra 86,4 tỷ invoice IDs, còn Redis command execution vẫn tuần tự. Vì vậy cần thay đổi đơn vị xử lý, không chỉ tăng batch.
 
 ## Decision
 

@@ -142,6 +142,34 @@
       "note": "Separate smoke test; not the 100k benchmark."
     }
   },
+  "stage2ADeltaPipeline": {
+    "measuredAt": "2026-11-27T08:39:05Z",
+    "configuration": {
+      "totalUniqueEvents": 100000,
+      "companyCount": 20,
+      "topics": "invoice-events → company-reward-deltas",
+      "invoiceClaimStore": "Redis Set with recoverable per-partition marker",
+      "leaderboardStore": "Redis Sorted Set with processed delta Set",
+      "note": "Synchronous per-company delta publication in the invoice processor."
+    },
+    "results": {
+      "producerAckedEventsPerSecond": 98231.42,
+      "twoHopEndToEndEventsPerSecond": 64461.46,
+      "leaderboardP95Ms": 1.56,
+      "expectedPoints": 1000000,
+      "observedPoints": 1000000
+    },
+    "correctness": {
+      "batchAndDuplicateSmoke": "2 unique invoices + 1 duplicate = 20 points",
+      "invoiceClaimSetCardinality": 2,
+      "deltaSetCardinality": 1,
+      "finalKafkaLag": 0
+    },
+    "targetAssessment": {
+      "oneHundredThousandEventsPerSecondMet": false,
+      "p95MeasuredUnderLoad": false
+    }
+  },
   "baselineBeforeOptimization": {
     "endToEndEventsPerSecond": 5602.61,
     "leaderboardP95Ms": 5.051,

@@ -49,9 +49,11 @@ spring:
 app:
   kafka:
     topic: invoice-events
+    delta-topic: company-reward-deltas
     dlt-topic: invoice-events.DLT
   leaderboard:
     key: einv:leaderboard
+    processed-delta-set: "einv:processed-deltas"
   reward:
     points-per-invoice: 10
     processed-set: "einv:processed-invoices"

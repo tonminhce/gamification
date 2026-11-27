@@ -1,6 +1,6 @@
-package com.vnpt.einvoice.gamification.reward;
+package com.vnpt.einvoice.gamification.leaderboard;
 
-import com.vnpt.einvoice.gamification.event.InvoiceIssuedEvent;
+import com.vnpt.einvoice.gamification.event.CompanyRewardDelta;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.core.io.ClassPathResource;
 import org.springframework.dao.DataAccessException;
@@ -16,83 +16,73 @@ import org.springframework.stereotype.Service;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.List;
-import java.util.UUID;
 
 @Service
-public class RewardService {
+public class LeaderboardApplyService {
 
     private static final StringRedisSerializer SERIALIZER = StringRedisSerializer.UTF_8;
-    private static final String BATCH_KEY_PREFIX = "einv:reward-batch:";
+    private static final String MARKER_PREFIX = "einv:delta-batch:";
 
     private final StringRedisTemplate redisTemplate;
-    private final byte[] applyRewardScript;
+    private final byte[] script;
     private final String leaderboardKeyName;
     private final byte[] leaderboardKey;
-    private final byte[] pointsPerInvoice;
-    private final byte[] batchMarkerTtl;
-    private final String processedSetName;
-    private final byte[] processedSet;
+    private final byte[] markerTtl;
+    private final String processedDeltaSetName;
+    private final byte[] processedDeltaSet;
     private volatile String scriptSha;
 
-    public RewardService(
+    public LeaderboardApplyService(
             StringRedisTemplate redisTemplate,
             @Value("${app.leaderboard.key}") String leaderboardKey,
-            @Value("${app.reward.processed-set}") String processedSet,
-            @Value("${app.reward.points-per-invoice}") long pointsPerInvoice,
-            @Value("${app.reward.batch-marker-ttl-seconds}") long batchMarkerTtlSeconds
+            @Value("${app.leaderboard.processed-delta-set}") String processedDeltaSet,
+            @Value("${app.reward.batch-marker-ttl-seconds}") long markerTtlSeconds
     ) {
         this.redisTemplate = redisTemplate;
-        this.processedSetName = processedSet;
-        this.processedSet = SERIALIZER.serialize(processedSet);
         this.leaderboardKeyName = leaderboardKey;
         this.leaderboardKey = SERIALIZER.serialize(leaderboardKey);
-        this.pointsPerInvoice = SERIALIZER.serialize(Long.toString(pointsPerInvoice));
-        this.batchMarkerTtl = SERIALIZER.serialize(Long.toString(batchMarkerTtlSeconds));
+        this.markerTtl = SERIALIZER.serialize(Long.toString(markerTtlSeconds));
+        this.processedDeltaSetName = processedDeltaSet;
+        this.processedDeltaSet = SERIALIZER.serialize(processedDeltaSet);
 
-        DefaultRedisScript<Long> script = new DefaultRedisScript<>();
-        script.setLocation(new ClassPathResource("scripts/apply_reward_batch.lua"));
-        script.setResultType(Long.class);
-        this.applyRewardScript = script.getScriptAsString().getBytes(StandardCharsets.UTF_8);
+        DefaultRedisScript<Long> redisScript = new DefaultRedisScript<>();
+        redisScript.setLocation(new ClassPathResource("scripts/apply_delta_batch.lua"));
+        redisScript.setResultType(Long.class);
+        this.script = redisScript.getScriptAsString().getBytes(StandardCharsets.UTF_8);
     }
 
-    public int applyRewards(List<InvoiceIssuedEvent> events) {
-        return applyRewards(events, UUID.randomUUID().toString());
-    }
-
-    public int applyRewards(List<InvoiceIssuedEvent> events, String batchId) {
-        if (events.isEmpty()) {
+    public int applyDeltas(List<CompanyRewardDelta> deltas, String markerId) {
+        if (deltas.isEmpty()) {
             return 0;
         }
 
         validateKeyTypes();
-        byte[] batchKey = SERIALIZER.serialize(BATCH_KEY_PREFIX + batchId);
-        List<byte[]> arguments = new ArrayList<>(2 + events.size() * 2);
-        arguments.add(pointsPerInvoice);
-        arguments.add(batchMarkerTtl);
-        for (InvoiceIssuedEvent event : events) {
-            arguments.add(SERIALIZER.serialize(event.invoiceId()));
-            arguments.add(SERIALIZER.serialize(event.companyId()));
+        List<byte[]> arguments = new ArrayList<>(1 + deltas.size() * 3);
+        arguments.add(markerTtl);
+        for (CompanyRewardDelta delta : deltas) {
+            arguments.add(SERIALIZER.serialize(delta.deltaId()));
+            arguments.add(SERIALIZER.serialize(delta.companyId()));
+            arguments.add(SERIALIZER.serialize(Long.toString(delta.deltaPoints())));
         }
-        byte[][] scriptArguments = arguments.toArray(byte[][]::new);
+        byte[][] keysAndArguments = new byte[arguments.size() + 3][];
+        keysAndArguments[0] = leaderboardKey;
+        keysAndArguments[1] = SERIALIZER.serialize(MARKER_PREFIX + markerId);
+        keysAndArguments[2] = processedDeltaSet;
+        System.arraycopy(arguments.toArray(byte[][]::new), 0, keysAndArguments, 3, arguments.size());
 
         try {
-            return executeBatch(batchKey, scriptArguments, scriptSha());
+            return execute(keysAndArguments, scriptSha());
         } catch (DataAccessException ex) {
             Throwable cause = ex.getMostSpecificCause();
             if (cause.getMessage() == null || !cause.getMessage().contains("NOSCRIPT")) {
                 throw ex;
             }
             scriptSha = null;
-            return executeBatch(batchKey, scriptArguments, scriptSha());
+            return execute(keysAndArguments, scriptSha());
         }
     }
 
-    private int executeBatch(byte[] batchKey, byte[][] arguments, String sha) {
-        byte[][] keysAndArguments = new byte[arguments.length + 3][];
-        keysAndArguments[0] = leaderboardKey;
-        keysAndArguments[1] = batchKey;
-        keysAndArguments[2] = processedSet;
-        System.arraycopy(arguments, 0, keysAndArguments, 3, arguments.length);
+    private int execute(byte[][] keysAndArguments, String sha) {
         Long applied = redisTemplate.execute((RedisCallback<Long>) connection -> connection.evalSha(
                 sha,
                 ReturnType.INTEGER,
@@ -100,7 +90,7 @@ public class RewardService {
                 keysAndArguments
         ));
         if (applied == null) {
-            throw new IllegalStateException("Reward batch script returned no result");
+            throw new IllegalStateException("Leaderboard delta script returned no result");
         }
         return applied.intValue();
     }
@@ -110,9 +100,9 @@ public class RewardService {
         if (leaderboardType != DataType.NONE && leaderboardType != DataType.ZSET) {
             throw new RedisSystemException("leaderboard key has unexpected type: " + leaderboardType, null);
         }
-        DataType processedType = redisTemplate.type(processedSetName);
+        DataType processedType = redisTemplate.type(processedDeltaSetName);
         if (processedType != DataType.NONE && processedType != DataType.SET) {
-            throw new RedisSystemException("processed invoice set has unexpected type: " + processedType, null);
+            throw new RedisSystemException("processed delta set has unexpected type: " + processedType, null);
         }
     }
 
@@ -123,7 +113,7 @@ public class RewardService {
                 sha = scriptSha;
                 if (sha == null) {
                     sha = redisTemplate.execute(
-                            (RedisCallback<String>) connection -> connection.scriptLoad(applyRewardScript)
+                            (RedisCallback<String>) connection -> connection.scriptLoad(script)
                     );
                     if (sha == null) {
                         throw new IllegalStateException("Redis returned no script SHA");

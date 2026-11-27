@@ -39,6 +39,8 @@ Mỗi stage phải có **exit criteria đo được**. Không tăng partition, c
 
 ## Stage 2 — 300k events/s và tách correctness state
 
+**Trạng thái:** Stage 2A đã code xong. Pipeline hiện là `invoice-events → invoice claim/aggregate → company-reward-deltas → leaderboard projector → Redis`. Exact invoice claim vẫn dùng Redis Set; partitioned state store và time-window aggregation trước Kafka là Stage 2B. Benchmark Stage 2A: 64.461,46 events/s end-to-end, p95 1,56 ms post-drain.
+
 ### Công việc
 
 - [ ] Thêm topic `company-reward-deltas` với `deltaId` deterministic.
