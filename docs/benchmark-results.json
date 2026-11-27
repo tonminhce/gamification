@@ -88,6 +88,60 @@
     "failedRequests": 0,
     "consumerLagAfterBurst": 0
   },
+  "stage1BatchLua": {
+    "measuredAt": "2026-11-27T03:32:26Z",
+    "environment": {
+      "kafka": "4.1.0 single node, 12 partitions",
+      "redis": "7.4 single node with AOF",
+      "note": "Host was also running unrelated containers; throughput variance was high."
+    },
+    "configuration": {
+      "totalUniqueEvents": 100000,
+      "companyCount": 20,
+      "consumerConcurrency": 12,
+      "maxPollRecords": 5000,
+      "luaChunkSize": 1000,
+      "dedupe": "Redis Set with SMISMEMBER and chunked SADD",
+      "aggregation": "one ZINCRBY per company per Kafka batch"
+    },
+    "bestRun": {
+      "runId": "DIRECT-1795750346186",
+      "producerAckedEventsPerSecond": 103273.31,
+      "directKafkaEndToEndEventsPerSecond": 88647.90,
+      "leaderboardP95Ms": 1.91,
+      "expectedPoints": 1000000,
+      "observedPoints": 1000000
+    },
+    "repeatedFinalConfigRuns": [
+      {
+        "runId": "DIRECT-1795750346186",
+        "directKafkaEndToEndEventsPerSecond": 88647.90,
+        "leaderboardP95Ms": 1.91
+      },
+      {
+        "runId": "DIRECT-1795750780692",
+        "directKafkaEndToEndEventsPerSecond": 58332.27,
+        "leaderboardP95Ms": 4.31
+      },
+      {
+        "runId": "DIRECT-1795766568962",
+        "directKafkaEndToEndEventsPerSecond": 56643.54,
+        "leaderboardP95Ms": 1.92,
+        "note": "Final code after stable per-partition marker, TTL, DLT and null-batch validation."
+      }
+    ],
+    "targetAssessment": {
+      "oneHundredThousandEventsPerSecondMet": false,
+      "approximatelyFiveMsP95Met": false,
+      "p95MeasuredUnderLoad": false,
+      "note": "Reported p95 comes from 200 sequential reads after drain on an idle system, not under concurrent leaderboard load."
+    },
+    "duplicateBatchSmoke": {
+      "twoUniqueInvoicesPoints": 20,
+      "processedSetCardinality": 2,
+      "note": "Separate smoke test; not the 100k benchmark."
+    }
+  },
   "baselineBeforeOptimization": {
     "endToEndEventsPerSecond": 5602.61,
     "leaderboardP95Ms": 5.051,

@@ -20,7 +20,17 @@ public class KafkaConfig {
             @Value("${app.kafka.topic}") String topic
     ) {
         return TopicBuilder.name(topic)
-                .partitions(3)
+                .partitions(12)
+                .replicas(1)
+                .build();
+    }
+
+    @Bean
+    org.apache.kafka.clients.admin.NewTopic invoiceEventsDltTopic(
+            @Value("${app.kafka.dlt-topic}") String topic
+    ) {
+        return TopicBuilder.name(topic)
+                .partitions(1)
                 .replicas(1)
                 .build();
     }

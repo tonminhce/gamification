@@ -1,6 +1,7 @@
 package com.vnpt.einvoice.gamification.invoice;
 
 import com.vnpt.einvoice.gamification.api.InvoiceAcceptedResponse;
+import com.vnpt.einvoice.gamification.api.InvoiceBatchAcceptedResponse;
 import com.vnpt.einvoice.gamification.api.InvoiceSimulationRequest;
 import com.vnpt.einvoice.gamification.event.InvoiceIssuedEvent;
 import com.vnpt.einvoice.gamification.exception.EventPublishException;
@@ -12,6 +13,7 @@ import org.springframework.kafka.core.KafkaTemplate;
 import org.springframework.stereotype.Service;
 
 import java.time.Instant;
+import java.util.List;
 import java.util.UUID;
 
 @Service
@@ -57,5 +59,12 @@ public class InvoiceEventPublisher {
                 eventId,
                 "PUBLISHING"
         );
+    }
+
+    public InvoiceBatchAcceptedResponse publishBatch(List<InvoiceSimulationRequest> requests) {
+        for (InvoiceSimulationRequest request : requests) {
+            publish(request);
+        }
+        return new InvoiceBatchAcceptedResponse(requests.size(), "PUBLISHING");
     }
 }

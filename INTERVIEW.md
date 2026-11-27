@@ -100,7 +100,7 @@ Auto commit is disabled at `src/main/resources/application.yml:25`. Batch acknow
 - What does committing a batch offset mean?
 
 **Senior answer**  
-“The batch is redelivered. Lua sees the existing invoice marker and does not add points again. Auto-commit can acknowledge records before processing finishes, so I disabled it. A committed batch offset means every record before that position completed successfully; otherwise the consumer must retry.”
+“The batch is redelivered. Lua sees the existing processed Set entries and applied batch marker, so it does not add points again. Auto-commit can acknowledge records before processing finishes, so I disabled it. A committed batch offset means every record before that position completed successfully; otherwise the consumer must retry.”
 
 ## 6. Idempotency
 
@@ -111,7 +111,7 @@ Repeating the same operation has the same effect as performing it once.
 Kafka retries, producer retries, user retries, and batch redelivery can all repeat `INV-1001`.
 
 **Where is it implemented?**  
-`src/main/resources/scripts/apply_reward.lua` stores an `APPLIED` marker and recovers `PENDING` markers. `RewardService.java:37` invokes the script. The concurrency and partial-write tests are in `src/test/java/com/vnpt/einvoice/gamification/reward/RewardServiceIntegrationTest.java`.
+`src/main/resources/scripts/apply_reward_batch.lua` claims invoice IDs in a Redis Set and stores a recoverable `PENDING`/`A` batch marker. `RewardService.java:37` invokes the script. The concurrency and partial-write tests are in `src/test/java/com/vnpt/einvoice/gamification/reward/RewardServiceIntegrationTest.java`.
 
 **Interviewer questions**
 
@@ -131,7 +131,7 @@ A group of changes appears indivisible to other clients.
 Checking “not processed” and incrementing points must be one indivisible decision.
 
 **Where is it implemented?**  
-The complete operation is in `src/main/resources/scripts/apply_reward.lua:1`.
+The complete operation is in `src/main/resources/scripts/apply_reward_batch.lua:1`.
 
 **Interviewer questions**
 
@@ -151,7 +151,7 @@ Correctness depends on timing between concurrent operations.
 Separate `GET`, `SET`, and `ZINCRBY` calls allow two consumers to both see “not processed” and both add 10 points.
 
 **Where is it implemented?**  
-The race is removed by the single script in `src/main/resources/scripts/apply_reward.lua`. The 32-thread test in `RewardServiceIntegrationTest.java` exercises it against real Redis.
+The race is removed by the single script in `src/main/resources/scripts/apply_reward_batch.lua`. The 32-thread test in `RewardServiceIntegrationTest.java` exercises it against real Redis.
 
 **Interviewer questions**
 
@@ -171,7 +171,7 @@ A Redis data structure that maps unique members to numeric scores and keeps them
 We need points, top-N ranking, and individual rank without scanning every company.
 
 **Where is it implemented?**  
-Score update: `src/main/resources/scripts/apply_reward.lua`. Top list: `src/main/java/com/vnpt/einvoice/gamification/leaderboard/LeaderboardService.java:36`. Individual competition rank: `LeaderboardService.java`.
+Score update: `src/main/resources/scripts/apply_reward_batch.lua`. Top list: `src/main/java/com/vnpt/einvoice/gamification/leaderboard/LeaderboardService.java:36`. Individual competition rank: `LeaderboardService.java`.
 
 **Interviewer questions**
 
@@ -191,7 +191,7 @@ Server-side code executed atomically inside Redis.
 It removes network round trips and prevents other clients from interleaving the idempotency check with the score update.
 
 **Where is it implemented?**  
-`src/main/resources/scripts/apply_reward.lua`; loaded and executed by `RewardService.java:37`.
+`src/main/resources/scripts/apply_reward_batch.lua`; loaded and executed by `RewardService.java:37`.
 
 **Interviewer questions**
 
@@ -211,7 +211,7 @@ How operation cost grows with data size.
 The leaderboard must stay fast as company count grows.
 
 **Where is it implemented?**  
-`ZINCRBY` at `apply_reward.lua:16`; top range at `LeaderboardService.java:36`; rank at `LeaderboardService.java:64`.
+`ZINCRBY` in `apply_reward_batch.lua`; top range at `LeaderboardService.java:36`; rank in `LeaderboardService.java`.
 
 **Interviewer questions**
 
@@ -260,7 +260,7 @@ The target is approximately 5 ms p95, not just a good average.
 - What creates tail latency?
 
 **Senior answer**  
-“The final direct Kafka run measured 2.89 ms p95, and repeated runs ranged from 1.00 to 2.89 ms, but that is not a production guarantee. Tail latency can come from JVM pauses, GC, Redis contention, network scheduling, Kafka rebalances, or large responses. A real test needs production-like data, sustained load, multiple runs, and percentile reporting under concurrent reads and writes.”
+“The best Stage 1 direct Kafka run measured 1.91 ms p95, and a repeated run measured 4.31 ms; this was after ingest drained, not under concurrent load, so it is not a production guarantee. Tail latency can come from JVM pauses, GC, Redis contention, network scheduling, Kafka rebalances, or large responses. A real test needs production-like data, sustained load, multiple runs, and percentile reporting under concurrent reads and writes.”
 
 ## 14. Horizontal Scaling
 
@@ -275,7 +275,7 @@ Consumer group and concurrency are in `src/main/resources/application.yml:22` an
 
 **Interviewer questions**
 
-- How many consumers are useful with three partitions?
+- How many consumers are useful with twelve partitions?
 - Does adding instances improve Redis unlimitedly?
 - What breaks first?
 
@@ -291,7 +291,7 @@ Choosing which guarantees and operational costs matter for the workload.
 The POC deliberately chooses simplicity, at-least-once delivery, permanent idempotency, and direct Redis reads.
 
 **Where is it implemented?**  
-The choices are visible in `application.yml`, `apply_reward.lua`, and `LeaderboardService.java`.
+The choices are visible in `application.yml`, `apply_reward_batch.lua`, and `LeaderboardService.java`.
 
 **Interviewer questions**
 
@@ -311,7 +311,7 @@ A processing system appears to apply each event exactly once despite failures an
 It is a common interview follow-up because Kafka and Redis are separate systems.
 
 **Where is it implemented?**  
-There is no end-to-end exactly-once claim. Producer idempotence is enabled at `src/main/resources/application.yml:17`; business idempotency is implemented in `apply_reward.lua`.
+There is no end-to-end exactly-once claim. Producer idempotence is enabled at `src/main/resources/application.yml:17`; business idempotency is implemented in `apply_reward_batch.lua`.
 
 **Interviewer questions**
 
@@ -330,26 +330,26 @@ VNPT's e-Invoice platform handles invoice-related events for many companies. The
 
 ## Task
 
-Build a small, reliable event-driven POC that separates invoice issuance from reward processing, updates points atomically, and keeps leaderboard reads fast. The design targets 10,000 events/s and about 5 ms p95 leaderboard latency, but those are targets to measure rather than claims.
+Build a small, reliable event-driven POC that separates invoice issuance from reward processing, updates points atomically, and keeps leaderboard reads fast. Stage 1 targets 100,000 events/s and about 5 ms p95; the longer-term architecture targets 1M/s. These are targets to measure rather than claims.
 
 ## Action
 
-I used one Spring Boot application. The invoice API validates the request and queues an `INVOICE_ISSUED` event asynchronously using `companyId` as the Kafka key. A consumer group processes three partitions with batch acknowledgments, so offsets are committed only after the whole batch succeeds. The consumer sends up to 500 Lua executions through one Redis pipeline; each script remains atomic and stores a recoverable `PENDING`/`APPLIED` invoice marker. If a script fails between the marker write and score update, the retry uses the stored pre-update score to finish safely. Leaderboard reads use descending Sorted Set ranges, score lookups, and competition-rank counting. Discounts are derived dynamically from points.
+I used one Spring Boot application. The invoice API supports single and batch requests and queues `INVOICE_ISSUED` events asynchronously using `companyId` as the Kafka key. A consumer group processes 12 partitions with batch acknowledgments, so offsets are committed only after the whole batch succeeds. The consumer sends one Lua call per Kafka batch: `SMISMEMBER` finds new invoice IDs, chunked `SADD` claims them, points are aggregated per company, and a recoverable batch marker coordinates score updates. If the script fails midway, retry uses the stored company deltas and pre-update scores to finish safely. Leaderboard reads use descending Sorted Set ranges, score lookups, and competition-rank counting.
 
-I tested discount boundaries, duplicate delivery, 32 concurrent virtual threads against real Redis, a 300-record pipeline with 100 duplicates, both partial-write recovery points, malformed REST input, and the full REST-to-Kafka-to-Redis flow. I also ran repeated 10,000-event direct Kafka benchmarks and a separate REST duplicate benchmark.
+I tested discount boundaries, duplicate delivery, 32 concurrent virtual threads against real Redis, a 5,000-event Lua batch, both partial-write recovery points, malformed REST input, script-cache flush, and the full REST-to-Kafka-to-Redis flow. I also ran 100,000-event direct Kafka benchmarks.
 
 ## Result
 
-On the local Docker POC, the final direct Kafka run measured 23,703.57 producer-acked events/s, 11,513.81 unique end-to-end events/s, and 2.89 ms leaderboard p95. Four direct runs ranged from 11,513.81 to 13,622.93 events/s with 1.00–2.89 ms p95. All 100,000 expected points were present. In the separate REST test, 1,000 duplicate deliveries left points unchanged and Kafka lag returned to zero.
+On the local Docker POC, the best Stage 1 run measured 103,273.31 producer-acked events/s, 88,647.90 unique end-to-end events/s, and 1.91 ms leaderboard p95. A repeated final-config run measured 58,332.27 events/s and 4.31 ms p95 because the host was also running other containers. All 1,000,000 expected points were present, and the duplicate batch smoke test produced exactly 20 points for two unique invoices.
 
-These are local POC results, not VNPT production measurements. The 10,000 Kafka events/s and about 5 ms p95 targets were met in the direct benchmark. The next production work would be an outbox or delivery-status store, more partitions and consumers, Redis capacity planning, and an idempotency-key retention strategy.
+These are local POC results, not VNPT production measurements. The earlier 10,000 events/s target was met, but the Stage 1 100,000 events/s gate was not met consistently. The next stage is the reward-delta topic, partitioned exact state store, company coalescing and dedicated leaderboard projector rather than more local tuning.
 
 ## Natural 1–2 minute English interview explanation
 
 “I built a small VNPT e-Invoice gamification POC to practice the backend design rather than claim a production system. The invoice API validates the request, queues an `INVOICE_ISSUED` event asynchronously, and returns 202 with publishing status, so reward processing does not block invoice issuance.
 
-The consumer processes events from three partitions. It uses batch acknowledgments, meaning Kafka offsets are committed only after the whole batch succeeds, and sends the Redis Lua executions through a pipeline. The important correctness boundary is still each atomic Lua script: it records a recoverable invoice marker and increments the company's Sorted Set score by 10. If a script fails between the marker write and the score update, the retry can finish safely without double awards. That handles Kafka redelivery, producer retries, and concurrent consumers.
+The consumer processes events from 12 partitions. It uses batch acknowledgments, meaning Kafka offsets are committed only after the whole batch succeeds, and sends one Lua call per Kafka batch. The script checks and claims invoice IDs in a Redis Set, aggregates points per company, and uses a recoverable batch marker around the score updates. If it fails midway, retry can finish safely without double awards. That handles Kafka redelivery, producer retries, and concurrent consumers.
 
 Leaderboard reads use Redis Sorted Sets directly, so top-N, points, and rank do not require scanning a database. Discounts are calculated from the current score.
 
-I verified duplicate and concurrent behavior with real Redis and ran repeated 10,000-event direct Kafka benchmarks. Locally, the final run measured 11,513.81 unique end-to-end events per second and 2.89 ms p95 leaderboard latency. The separate REST duplicate test was also correct and Kafka lag returned to zero. Both performance targets were met in the local POC, but I would not present those numbers as production capacity. The next steps would be an outbox, more partitions, Redis capacity planning, and a production policy for idempotency-key retention.”
+I verified duplicate and concurrent behavior with real Redis and ran 100,000-event direct Kafka benchmarks. Locally, the best run measured 88,647.90 unique end-to-end events per second and 1.91 ms p95 leaderboard latency. The 100k gate was not met consistently on the shared host, so I would not present that as production capacity. The next step is Stage 2: a reward-delta topic, partitioned exact state store and dedicated leaderboard projector.”

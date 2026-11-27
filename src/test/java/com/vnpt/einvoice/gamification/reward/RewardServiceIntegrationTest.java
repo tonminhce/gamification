@@ -18,6 +18,7 @@ import org.testcontainers.junit.jupiter.Testcontainers;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.UUID;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
@@ -33,7 +34,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 class RewardServiceIntegrationTest {
 
     private static final String LEADERBOARD_KEY = "einv:leaderboard";
-    private static final String PROCESSED_PREFIX = "einv:processed:";
+    private static final String PROCESSED_SET = "einv:processed-invoices";
 
     @Container
     static GenericContainer<?> redis = new GenericContainer<>("redis:7.4-alpine")
@@ -57,7 +58,7 @@ class RewardServiceIntegrationTest {
             connection.flushDb();
             return null;
         });
-        rewardService = new RewardService(redisTemplate, LEADERBOARD_KEY, PROCESSED_PREFIX, 10);
+        rewardService = new RewardService(redisTemplate, LEADERBOARD_KEY, PROCESSED_SET, 10, 604_800);
     }
 
     @AfterEach
@@ -69,25 +70,24 @@ class RewardServiceIntegrationTest {
     void rewardsAnInvoiceOnlyOnce() {
         InvoiceIssuedEvent event = event("INV-1", "COMPANY-A");
 
-        assertTrue(rewardService.applyReward(event));
-        assertFalse(rewardService.applyReward(event));
+        assertEquals(1, apply(event));
+        assertEquals(0, apply(event));
 
         assertEquals(10.0, redisTemplate.opsForZSet().score(LEADERBOARD_KEY, "COMPANY-A"));
-        String marker = redisTemplate.opsForValue().get(PROCESSED_PREFIX + "INV-1");
-        assertTrue(marker != null && marker.contains("\"state\":\"APPLIED\""));
+        assertTrue(redisTemplate.opsForSet().isMember(PROCESSED_SET, "INV-1"));
     }
 
     @Test
-    void pipelinedBatchAppliesEachInvoiceOnlyOnce() {
+    void batchedScriptAppliesEachInvoiceOnlyOnce() {
         List<InvoiceIssuedEvent> events = new ArrayList<>();
         for (int i = 0; i < 200; i++) {
             events.add(event("INV-BATCH-" + i, "BATCH-COMPANY-" + (i % 10)));
         }
         events.addAll(new ArrayList<>(events.subList(0, 100)));
 
-        List<Boolean> results = rewardService.applyRewards(events);
+        int applied = rewardService.applyRewards(events);
 
-        assertEquals(200, results.stream().filter(Boolean::booleanValue).count());
+        assertEquals(200, applied);
         for (int company = 0; company < 10; company++) {
             assertEquals(200.0, redisTemplate.opsForZSet().score(
                     LEADERBOARD_KEY,
@@ -97,13 +97,41 @@ class RewardServiceIntegrationTest {
     }
 
     @Test
+    void handlesFiveThousandEventBatch() {
+        List<InvoiceIssuedEvent> events = new ArrayList<>();
+        for (int i = 0; i < 5000; i++) {
+            events.add(event("INV-LARGE-" + i, "LARGE-COMPANY-" + (i % 10)));
+        }
+
+        assertEquals(5000, rewardService.applyRewards(events));
+        for (int company = 0; company < 10; company++) {
+            assertEquals(5000.0, redisTemplate.opsForZSet().score(
+                    LEADERBOARD_KEY,
+                    "LARGE-COMPANY-" + company
+            ));
+        }
+    }
+
+    @Test
+    void reloadsScriptAfterRedisScriptCacheIsFlushed() {
+        assertEquals(1, apply(event("INV-BEFORE-FLUSH", "COMPANY-A")));
+        redisTemplate.execute((RedisCallback<Object>) connection -> {
+            connection.scriptFlush();
+            return null;
+        });
+
+        assertEquals(1, apply(event("INV-AFTER-FLUSH", "COMPANY-A")));
+        assertEquals(20.0, redisTemplate.opsForZSet().score(LEADERBOARD_KEY, "COMPANY-A"));
+    }
+
+    @Test
     void concurrentDuplicatesAwardExactlyTenPoints() throws Exception {
         InvoiceIssuedEvent event = event("INV-CONCURRENT", "COMPANY-A");
 
         try (ExecutorService executor = Executors.newVirtualThreadPerTaskExecutor()) {
             List<Future<Boolean>> results = new ArrayList<>();
             for (int i = 0; i < 32; i++) {
-                results.add(executor.submit(() -> rewardService.applyReward(event)));
+                results.add(executor.submit(() -> apply(event) == 1));
             }
 
             int appliedCount = 0;
@@ -121,11 +149,14 @@ class RewardServiceIntegrationTest {
     @Test
     void recoversWhenScriptFailedAfterWritingPendingMarker() {
         redisTemplate.opsForValue().set(
-                PROCESSED_PREFIX + "INV-PARTIAL-BEFORE",
-                "{\"state\":\"PENDING\",\"companyId\":\"COMPANY-A\",\"points\":10,\"scoreBefore\":0}"
+                "einv:reward-batch:PARTIAL-BEFORE",
+                "{\"state\":\"PENDING\",\"invoiceIds\":[\"INV-PARTIAL-BEFORE\"],\"companies\":[{\"companyId\":\"COMPANY-A\",\"delta\":10,\"scoreBefore\":0}]}"
         );
 
-        assertTrue(rewardService.applyReward(event("INV-PARTIAL-BEFORE", "COMPANY-A")));
+        assertEquals(0, rewardService.applyRewards(
+                List.of(event("INV-PARTIAL-BEFORE", "COMPANY-A")),
+                "PARTIAL-BEFORE"
+        ));
         assertEquals(10.0, redisTemplate.opsForZSet().score(LEADERBOARD_KEY, "COMPANY-A"));
     }
 
@@ -133,18 +164,21 @@ class RewardServiceIntegrationTest {
     void recoversWhenScriptFailedAfterIncrementingScore() {
         redisTemplate.opsForZSet().add(LEADERBOARD_KEY, "COMPANY-A", 10.0);
         redisTemplate.opsForValue().set(
-                PROCESSED_PREFIX + "INV-PARTIAL-AFTER",
-                "{\"state\":\"PENDING\",\"companyId\":\"COMPANY-A\",\"points\":10,\"scoreBefore\":0}"
+                "einv:reward-batch:PARTIAL-AFTER",
+                "{\"state\":\"PENDING\",\"invoiceIds\":[\"INV-PARTIAL-AFTER\"],\"companies\":[{\"companyId\":\"COMPANY-A\",\"delta\":10,\"scoreBefore\":0}]}"
         );
 
-        assertTrue(rewardService.applyReward(event("INV-PARTIAL-AFTER", "COMPANY-A")));
+        assertEquals(0, rewardService.applyRewards(
+                List.of(event("INV-PARTIAL-AFTER", "COMPANY-A")),
+                "PARTIAL-AFTER"
+        ));
         assertEquals(10.0, redisTemplate.opsForZSet().score(LEADERBOARD_KEY, "COMPANY-A"));
     }
 
     @Test
     void invoiceIdIsTheGlobalBusinessIdempotencyKey() {
-        assertTrue(rewardService.applyReward(event("INV-SAME", "COMPANY-A")));
-        assertFalse(rewardService.applyReward(event("INV-SAME", "COMPANY-B")));
+        assertEquals(1, apply(event("INV-SAME", "COMPANY-A")));
+        assertEquals(0, apply(event("INV-SAME", "COMPANY-B")));
 
         assertNull(redisTemplate.opsForZSet().score(LEADERBOARD_KEY, "COMPANY-B"));
     }
@@ -154,9 +188,13 @@ class RewardServiceIntegrationTest {
         redisTemplate.opsForValue().set(LEADERBOARD_KEY, "wrong-type");
 
         assertThrows(DataAccessException.class,
-                () -> rewardService.applyReward(event("INV-TYPE", "COMPANY-A")));
+                () -> apply(event("INV-TYPE", "COMPANY-A")));
 
-        assertNull(redisTemplate.opsForValue().get(PROCESSED_PREFIX + "INV-TYPE"));
+        assertFalse(redisTemplate.opsForSet().isMember(PROCESSED_SET, "INV-TYPE"));
+    }
+
+    private int apply(InvoiceIssuedEvent event) {
+        return rewardService.applyRewards(List.of(event), UUID.randomUUID().toString());
     }
 
     private InvoiceIssuedEvent event(String invoiceId, String companyId) {
