@@ -24,7 +24,7 @@ public class LeaderboardProjector {
         this.applyService = applyService;
     }
 
-    @KafkaListener(topics = "${app.kafka.delta-topic}", batch = "true")
+    @KafkaListener(id = "leaderboardProjector", idIsGroup = false, topics = "${app.kafka.delta-topic}", batch = "true")
     public void consume(List<ConsumerRecord<String, CompanyRewardDelta>> records) {
         if (records.isEmpty()) {
             return;

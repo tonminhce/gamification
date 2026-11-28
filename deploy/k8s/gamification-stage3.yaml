@@ -1,0 +1,128 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: gamification-stage3-config
+data:
+  SPRING_PROFILES_ACTIVE: "stage3"
+  APP_KAFKA_PARTITIONS: "64"
+  APP_KAFKA_REPLICATION_FACTOR: "3"
+  APP_DEDUPE_MODE: "streams-rocksdb"
+  APP_INGEST_ACK_MODE: "async"
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: gamification-processor
+spec:
+  serviceName: gamification-headless
+  replicas: 8
+  podManagementPolicy: Parallel
+  selector:
+    matchLabels:
+      app: gamification
+  template:
+    metadata:
+      labels:
+        app: gamification
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/path: "/actuator/prometheus"
+        prometheus.io/port: "8080"
+    spec:
+      terminationGracePeriodSeconds: 60
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels:
+                    app: gamification
+                topologyKey: kubernetes.io/hostname
+      containers:
+        - name: gamification
+          image: vnpt/einvoice-gamification:stage3
+          ports:
+            - containerPort: 8080
+              name: http
+          envFrom:
+            - configMapRef:
+                name: gamification-stage3-config
+          env:
+            - name: STREAMS_STATE_DIR
+              value: "/var/lib/gamification/rocksdb"
+            - name: SNAPSHOT_DIR
+              value: "/var/lib/gamification/snapshots"
+            - name: JAVA_TOOL_OPTIONS
+              value: "--enable-native-access=ALL-UNNAMED -Xms4g -Xmx4g -XX:+UseG1GC -XX:MaxGCPauseMillis=20"
+          resources:
+            requests:
+              cpu: "4"
+              memory: "8Gi"
+            limits:
+              cpu: "8"
+              memory: "12Gi"
+          readinessProbe:
+            httpGet:
+              path: /actuator/health/readiness
+              port: 8080
+            initialDelaySeconds: 15
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /actuator/health/liveness
+              port: 8080
+            initialDelaySeconds: 30
+            periodSeconds: 10
+          volumeMounts:
+            - name: state-volume
+              mountPath: /var/lib/gamification/rocksdb
+            - name: snapshot-volume
+              mountPath: /var/lib/gamification/snapshots
+  volumeClaimTemplates:
+    - metadata:
+        name: state-volume
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        storageClassName: local-nvme
+        resources:
+          requests:
+            storage: 200Gi
+    - metadata:
+        name: snapshot-volume
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 20Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: gamification-api
+spec:
+  selector:
+    app: gamification
+  ports:
+    - name: http
+      port: 80
+      targetPort: 8080
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: gamification-hpa
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: StatefulSet
+    name: gamification-processor
+  minReplicas: 8
+  maxReplicas: 32
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 65

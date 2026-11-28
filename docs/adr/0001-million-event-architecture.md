@@ -11,22 +11,22 @@ POC hiện tại đã chứng minh đường Java 25/Spring Boot 4 → Kafka →
 
 Kiến trúc “mỗi invoice → một Lua script → một Redis marker” chưa được chứng minh là phù hợp ở 1M/s. Stage 1 đã thay bằng batch API, 12 partitions và một Lua batch script dùng Redis Set. Stage 2A đã thêm reward-delta topic và leaderboard projector. Stage 2B đã thay Redis claim bằng Kafka Streams `exactly_once_v2`, RocksDB dedupe store có changelog và time-window aggregation 500 ms trước delta topic. Ở tốc độ 1M/s, mỗi event vẫn cần exact lookup và thao tác cập nhật, retention 24 giờ tạo ra 86,4 tỷ invoice IDs, còn Redis command execution vẫn tuần tự. Vì vậy cần thay đổi đơn vị xử lý và partition/coalesce, không chỉ tăng batch.
 
-### Trạng thái triển khai Stage 2B+ (2026-11-28)
+### Trạng thái triển khai Stage 2B+ & Stage 3 Engineering Suite (2026-11-28)
 
-Đã hoàn thiện trong POC:
+Đã hoàn thiện trong codebase & xác minh tự động/live trên máy local:
 
 - Hai hop `invoice-events → company-reward-deltas → Redis`, Streams `exactly_once_v2`, broker Kafka 4.4.0.
-- Dedupe `invoiceId` trong bounded-retention RocksDB `WindowStore` (`24h` mặc định) + changelog, 3-bucket `TimeBucketedBloomFilter` (saturation fallback), phát hiện expired timestamp & conflict cùng `invoiceId` khác `companyId` và quarantine sang `invoice-events.DLT`.
-- `HighThroughputRocksDBConfig`: shared 256 MB `LRUCache`, 16 MB write buffer, 16 KB blocks, per-instance native SST Bloom filter, nén `LZ4` (`31–32 MB` cho 3,61M keys).
-- Window aggregation 500 ms với `TreeMap` index O(ready), `deltaId` deterministic dạng `partition:windowStart:companyId:seq`.
-- Projector `isolation.level=read_committed`, multi-partition grouping, per-partition offset checkpoint, daily-bucketed TTL delta Sets và `PENDING` recovery marker có kiểm tra pre-update scores trước khi ghi.
-- Read path 1-RTT `rank_and_score.lua` + 50 ms single-flight Top-100 micro-cache (`initLock`); REST ingress dùng Java 25 Virtual Threads, `Semaphore` backpressure (`503 Retry-After: 1`), và Actuator `kafkaStreams` health + Micrometer metrics.
-- 49 test pass (bao gồm `GamificationEndToEndIntegrationTest` chạy trên Testcontainers Kafka 4.4.0 + Redis 7.4). Ba run 1M direct Kafka đạt **99.746,53 / 138.627,96 / 98.800,41 events/s** end-to-end (drain **175k–201k/s**), post-drain p95 **0,27–0,62 ms**, under-load p95 **13,55–17,19 ms**; 500k REST batch đạt **142.788,10 accepted/s** (**96.606,04 E2E/s**, p95 **1,05 ms**); bản hardened sau code review (`49/49` tests) hạ under-load Top-100 p95 xuống **3,54–8,32 ms** trên 17,9k–24,0k reads (Bloom skip **99.9999%**, drain **156,0k/s** dù share Docker VM với stack khác) và restore 3,61M keys sau restart trong **30,41 s** với 0 điểm trùng.
+- Dedupe `invoiceId` với 2 chế độ cấu hình:
+  - **Mặc định (`streams-rocksdb`):** bounded-retention RocksDB `WindowStore` (`24h` + cutoff reject sang DLT), 3-bucket `TimeBucketedBloomFilter`, phát hiện conflict sang `invoice-events.DLT`; `HighThroughputRocksDBConfig` (`LRUCache`, `LZ4`, 16 MB write buffer, per-instance SST Bloom -> `32 MB` cho 3,61M keys).
+  - **Stage 3 (`external-ledger`):** `DedupeLedger` SPI + `RedisLwtDedupeLedger` (`claim_invoice_lwt.lua` `CLAIMED -> EMITTED` CAS) + schema ScyllaDB TWCS tại `deploy/scylla/schema.cql`, giải phóng Streams khỏi local dedupe state để đổi partition count động.
+- Window aggregation 500 ms (`TreeMap` O(ready) + `WindowAccum`), `deltaId` deterministic `partition:windowStart:companyId:seq`, projector `read_committed`, multi-partition grouping, per-partition offset checkpoint (chịu tx control/abort gaps), daily TTL delta Sets và `PENDING` recovery.
+- Disaster recovery thực thi thật (`LeaderboardSnapshotService` + `/api/admin/snapshots` & `/rebuild`): capture atomic `ZSET` + per-partition offset manifest (kèm fallback committed offset cho partition nhàn rỗi) + delta markers, replay Kafka `read_committed` suffix -> live rebuild sau `FLUSHDB` khôi phục `3.010.020` điểm chính xác trong **`583 ms`**.
+- Ingress Virtual Threads (`async` mặc định + `broker-ack` batched `acks=all` RPO=0), `Semaphore` backpressure, `PublishCircuitBreaker` (`CLOSED/OPEN/HALF_OPEN`), actuator health + Micrometer metrics, cùng bộ manifest production `deploy/` (Kafka 3-broker RF3 64p, K8s StatefulSet/HPA, Prometheus alerts).
+- **56/56 test pass** (gồm `Stage3ChaosAndRebuildIntegrationTest`, `RedisLwtDedupeLedgerIntegrationTest`, `PublishCircuitBreakerTest`, `GamificationEndToEndIntegrationTest` trên Kafka 4.4.0 + Redis 7.4). Đo bằng Benchmark Contract (`scripts/Stage3LoadBenchmark.java`): Mode A (`300k`) đạt **261.073 accepted/s**, **101.940 applied/s**, post-drain p95 **0,67 ms**; Mode B `broker-ack` đạt **67.607–108.485 durable accepted/s**; Mode C `external-ledger` đạt **4.514 applied/s** (2 external RTT/invoice).
 
-Còn mở cho Stage 3 (cluster production):
+Còn mở cho Stage 3 hạ tầng multi-node:
 
-- Scale lên 64–128 partitions/RF3 multi-broker và external LWT ledger nếu cần đổi partition count động trong retention window.
-- Dedicated Redis HA + automated snapshot/manifest rebuild drill, chaos failover drill và sustained soak test 15–30 phút ở 300k/s–1M/s.
+- Scale thực tế lên 64–128 partitions/RF3 multi-broker cluster + ScyllaDB cluster thật + dedicated Redis HA, và chạy soak test 15–30 phút ở 300k/s–1M/s.
 
 ## Decision
 

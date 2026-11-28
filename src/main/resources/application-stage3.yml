@@ -1,0 +1,37 @@
+# Production Stage 3 profile (64 partitions, RF3, standby replicas, high-capacity tuning)
+spring:
+  kafka:
+    producer:
+      acks: all
+      batch-size: 131072
+      linger-ms: 5
+      buffer-memory: 134217728
+    consumer:
+      max-poll-records: 5000
+    listener:
+      concurrency: 16
+
+app:
+  kafka:
+    partitions: ${APP_KAFKA_PARTITIONS:64}
+    replication-factor: ${APP_KAFKA_REPLICATION_FACTOR:3}
+  streams:
+    threads: ${APP_STREAMS_THREADS:8}
+    standby-replicas: ${APP_STREAMS_STANDBY_REPLICAS:1}
+    commit-interval-ms: 500
+    rocksdb-block-cache-mb: 512
+    rocksdb-write-buffer-mb: 32
+  dedupe:
+    mode: ${APP_DEDUPE_MODE:streams-rocksdb}
+    claim-lease-ms: 5000
+    retention-ms: 86400000
+    bloom-expected-insertions: 4000000
+  ingest:
+    max-in-flight: 400000
+    ack-mode: ${APP_INGEST_ACK_MODE:async}
+    ack-timeout-ms: 5000
+    circuit-breaker:
+      enabled: true
+      failure-threshold: 25
+      open-duration-ms: 5000
+      half-open-max-probes: 5

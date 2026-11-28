@@ -96,7 +96,15 @@ Company points, rank, and discount are derived from the leaderboard; no duplicat
 ├── scripts/
 │   ├── KafkaLoadProducer.java
 │   ├── RestLoadProducer.java
+│   ├── Stage3LoadBenchmark.java
 │   └── load-test.mjs
+├── deploy/
+│   ├── docker-compose.stage3-cluster.yml
+│   ├── k8s/gamification-stage3.yaml
+│   ├── monitoring/
+│   │   ├── gamification-alerts.yml
+│   │   └── prometheus.yml
+│   └── scylla/schema.cql
 ├── docs/
 │   ├── benchmark-results.json
 │   ├── adr/0001-million-event-architecture.md
@@ -130,7 +138,8 @@ Company points, rank, and discount are derived from the leaderboard; no duplicat
     │   │   │   └── OverloadException.java
     │   │   ├── invoice/
     │   │   │   ├── InvoiceController.java
-    │   │   │   └── InvoiceEventPublisher.java
+    │   │   │   ├── InvoiceEventPublisher.java
+    │   │   │   └── PublishCircuitBreaker.java
     │   │   ├── leaderboard/
     │   │   │   ├── CompanyController.java
     │   │   │   ├── DiscountService.java
@@ -138,27 +147,40 @@ Company points, rank, and discount are derived from the leaderboard; no duplicat
     │   │   │   ├── LeaderboardController.java
     │   │   │   ├── LeaderboardProjector.java
     │   │   │   └── LeaderboardService.java
+    │   │   ├── ledger/
+    │   │   │   ├── DedupeLedger.java
+    │   │   │   └── RedisLwtDedupeLedger.java
     │   │   ├── metrics/
     │   │   │   └── RewardMetrics.java
+    │   │   ├── snapshot/
+    │   │   │   ├── LeaderboardSnapshot.java
+    │   │   │   ├── LeaderboardSnapshotService.java
+    │   │   │   └── SnapshotController.java
     │   │   └── streams/
     │   │       ├── DedupeProcessor.java
     │   │       ├── RewardTopology.java
     │   │       └── WindowAggregatorProcessor.java
     │   └── resources/
     │       ├── application.yml
+    │       ├── application-stage3.yml
     │       └── scripts/
     │           ├── apply_delta_batch.lua
+    │           ├── claim_invoice_lwt.lua
     │           └── rank_and_score.lua
     └── test/java/com/vnpt/einvoice/gamification/
         ├── GamificationEndToEndIntegrationTest.java
+        ├── Stage3ChaosAndRebuildIntegrationTest.java
         ├── config/HighThroughputRocksDBConfigTest.java
         ├── exception/ApiExceptionHandlerTest.java
-        ├── invoice/InvoiceEventPublisherTest.java
+        ├── invoice/
+        │   ├── InvoiceEventPublisherTest.java
+        │   └── PublishCircuitBreakerTest.java
         ├── leaderboard/
         │   ├── DiscountServiceTest.java
         │   ├── LeaderboardApplyServiceIntegrationTest.java
         │   ├── LeaderboardProjectorTest.java
         │   └── LeaderboardServiceTest.java
+        ├── ledger/RedisLwtDedupeLedgerIntegrationTest.java
         └── streams/RewardTopologyTest.java
 ```
 
@@ -166,16 +188,14 @@ Company points, rank, and discount are derived from the leaderboard; no duplicat
 
 | Concern | File |
 |---|---|
-| Producer settings, topics and typed `KafkaTemplate` | `src/main/resources/application.yml`, `src/main/java/com/vnpt/einvoice/gamification/config/KafkaConfig.java` |
-| Single/batch async publishing + backpressure | `src/main/java/com/vnpt/einvoice/gamification/invoice/InvoiceEventPublisher.java` |
-| Streams runtime, EOS_v2 and RocksDB tuning | `src/main/java/com/vnpt/einvoice/gamification/config/RewardStreamsConfig.java`, `HighThroughputRocksDBConfig.java` |
-| Topology, DLT, 3-bucket Bloom + WindowStore dedupe, window index | `src/main/java/com/vnpt/einvoice/gamification/streams/RewardTopology.java`, `DedupeProcessor.java`, `WindowAggregatorProcessor.java` |
-| Leaderboard delta projector + Lua | `src/main/java/com/vnpt/einvoice/gamification/leaderboard/LeaderboardProjector.java`, `LeaderboardApplyService.java`, `src/main/resources/scripts/apply_delta_batch.lua` |
-| Leaderboard, single-RTT rank, summary, micro-cache | `src/main/java/com/vnpt/einvoice/gamification/leaderboard/LeaderboardService.java`, `src/main/resources/scripts/rank_and_score.lua` |
-| Discount tiers | `src/main/java/com/vnpt/einvoice/gamification/leaderboard/DiscountService.java` |
-| Pipeline observability metrics | `src/main/java/com/vnpt/einvoice/gamification/metrics/RewardMetrics.java` |
-| REST validation and overload/error responses | `src/main/java/com/vnpt/einvoice/gamification/exception/ApiExceptionHandler.java`, `OverloadException.java` |
-| Full E2E, Streams and Redis integration tests | `src/test/java/com/vnpt/einvoice/gamification/GamificationEndToEndIntegrationTest.java`, `RewardTopologyTest.java`, `LeaderboardApplyServiceIntegrationTest.java` |
+| Producer settings, topics and typed `KafkaTemplate` | `src/main/resources/application.yml`, `application-stage3.yml`, `src/main/java/com/vnpt/einvoice/gamification/config/KafkaConfig.java` |
+| Single/batch publishing, `CircuitBreaker`, `async` / `broker-ack` | `src/main/java/com/vnpt/einvoice/gamification/invoice/InvoiceEventPublisher.java`, `PublishCircuitBreaker.java` |
+| Streams runtime, `EOS_v2`, standby replicas & RocksDB tuning | `src/main/java/com/vnpt/einvoice/gamification/config/RewardStreamsConfig.java`, `HighThroughputRocksDBConfig.java` |
+| Topology, DLT, 3-bucket Bloom + RocksDB / external ledger | `src/main/java/com/vnpt/einvoice/gamification/streams/RewardTopology.java`, `DedupeProcessor.java`, `WindowAggregatorProcessor.java` |
+| Pluggable `CLAIMED -> EMITTED` ledger SPI + Redis CAS Lua | `src/main/java/com/vnpt/einvoice/gamification/ledger/DedupeLedger.java`, `RedisLwtDedupeLedger.java`, `claim_invoice_lwt.lua` |
+| Consistent snapshot, partition-offset manifest & Kafka rebuild | `src/main/java/com/vnpt/einvoice/gamification/snapshot/LeaderboardSnapshotService.java`, `SnapshotController.java` |
+| Stage 3 RF3 64-partition cluster, K8s, Scylla CQL & alerts | `deploy/docker-compose.stage3-cluster.yml`, `deploy/k8s/gamification-stage3.yaml`, `deploy/scylla/schema.cql`, `deploy/monitoring/` |
+| Full E2E, chaos (`tx-abort`, wipe rebuild) & ledger tests | `Stage3ChaosAndRebuildIntegrationTest.java`, `GamificationEndToEndIntegrationTest.java`, `RedisLwtDedupeLedgerIntegrationTest.java` |
 
 ### Lua scripts
 
@@ -377,11 +397,13 @@ export JAVA_HOME=$(/usr/libexec/java_home -v 25)
 mvn test
 ```
 
-Expected: **49 automated tests** (`mvn test` / `mvn clean package`), 0 failures, 0 errors:
+Expected: **56 automated tests** (`mvn test` / `mvn clean package`), 0 failures, 0 errors:
+- `Stage3ChaosAndRebuildIntegrationTest` (Testcontainers real Kafka 4.4.0 + Redis 7.4): `read_committed` handling of aborted Kafka transactions + offset gaps, disaster Redis `FLUSHDB` + consistent snapshot/barrier suffix rebuild, cold Kafka retention rebuild, and batched `BROKER_ACK` durability mode.
+- `RedisLwtDedupeLedgerIntegrationTest` (Testcontainers Redis 7.4 + `TopologyTestDriver`): atomic `CLAIMED -> EMITTED` Lua CAS, uncommitted offset/expired lease recovery, conflict quarantine, and partition-independent Streams topology (zero local dedupe RocksDB store).
 - `GamificationEndToEndIntegrationTest` (Testcontainers real Kafka 4.4.0 + Redis 7.4 + full Spring Boot HTTP server): REST single/batch, competition ranking, discount tiers, duplicate replay, company conflict quarantine to DLT, poison-pill resilience, `kafkaStreams` Actuator health component, path-variable validation, and live Micrometer metrics.
 - `LeaderboardApplyServiceIntegrationTest` (Testcontainers Redis 7.4): multi-day bucketed TTL Sets, offset checkpoint gap tolerance, atomic `PENDING` crash recovery & partial mismatch rollback rejection, zero-points Lua guard, and atomic 1-RTT `rank_and_score.lua`.
 - `RewardTopologyTest`: dedupe, null/mismatched key & expired-timestamp DLT routing, conflict quarantine, multi-bucket Bloom + saturation fallback, and disk RocksDB restart restoration for dedupe & `nextEmitSeq`.
-- Unit tests covering `HighThroughputRocksDBConfig` (12-thread concurrent config & cleanup), `LeaderboardProjector` multi-partition grouping, `LeaderboardService` Top-100 slicing & cold-start single-flight cache, `InvoiceEventPublisher` partial-batch backpressure & permit safety, `DiscountService`, and `ApiExceptionHandler`.
+- Unit tests covering `PublishCircuitBreaker` + `BROKER_ACK`, `HighThroughputRocksDBConfig` (12-thread concurrent config & cleanup), `LeaderboardProjector` multi-partition grouping, `LeaderboardService` Top-100 slicing & cold-start single-flight cache, `InvoiceEventPublisher` partial-batch backpressure & permit safety, `DiscountService`, and `ApiExceptionHandler`.
 
 ### 11. Run the performance benchmark
 
@@ -446,7 +468,20 @@ A 100,000-event run is dominated by the fixed 500 ms window and projection drain
 | RocksDB footprint (3.61M keys, LZ4) | — | **31 MB on disk** |
 | Graceful restart & state restore (3.61M keys) | — | **30.41 s** (`33.97 s` earlier) `REBALANCING → RUNNING`; replay & conflict added **0 pts**, fresh invoice awarded **10 pts** |
 | Under-load leaderboard p95 (post-hardening, Top-100 cache) | — | **3.54 – 8.32 ms p95** across 17.9k–24.0k concurrent reads (`0.29 – 1.06 ms` post-drain; `3,609,997 / 3,610,000` Bloom skips = **99.9999%**, `32 MB` RocksDB) |
-| Automated JUnit + Testcontainers E2E | — | **49/49 passed** (`-Xlint:unchecked` clean) |
+| Automated JUnit + Testcontainers E2E & Stage 3 Chaos | — | **56/56 passed** (`-Xlint:unchecked` clean) |
+
+#### Stage 3 Engineering Suite verification (multi-mode + disaster rebuild)
+
+Using `scripts/Stage3LoadBenchmark.java` (Benchmark Contract reporting `offered / accepted / durable / processed / applied` rates, freshness probes, concurrent reads, and `droppedIterations`) plus `POST /api/admin/snapshots` & `/rebuild`:
+
+| Stage 3 Mode / Drill | Measured Rate & Latency | Correctness / Recovery Proof |
+|---|---|---|
+| **Mode A:** `async` + `streams-rocksdb` (300k, 1,000/req) | **256.8k offered/s**, **261.1k accepted/s**, **103.6k durable/s**, **101.9k applied/s**, `0.67 ms` post-drain P95, `21.29 ms` under-load P95, `944.8 ms` freshness P50 (`1,665.8 ms` P95) | `0` 503s, `0` dropped iterations, `3,000,020` exact points, `5,000` duplicates = 0 pts |
+| **Snapshot + `FLUSHDB` + Kafka Suffix Rebuild** | `583 ms` total rebuild RTO (`12` partition offsets, `4,419` delta markers restored, `120` suffix records replayed) | `3,000,020` snapshot + `10,000` suffix -> wiped to `0` -> rebuilt to **exact `3,010,020`** |
+| **Mode B:** Batched `broker-ack` (`RPO=0`, `acks=all`, 200k) | **67.6k – 108.5k durable accepted/s**, **53.3k – 64.0k applied/s**, `1.24 – 1.40 ms` post-drain P95, `14.05 – 14.94 ms` under-load P95 | Virtual Threads pay 1 broker RTT per 1,000 invoices; `2,000,020–2,000,030` exact pts |
+| **Mode C:** `external-ledger` (`RedisLwtDedupeLedger`, 50k) | **83.0k accepted/s**, **4.5k applied/s** (`CLAIM` + `EMIT` external Lua RTT per event, zero local RocksDB dedupe store) | Partition-independent `CLAIMED -> EMITTED` state machine; `500,010` exact pts |
+
+Cluster production manifests (`deploy/docker-compose.stage3-cluster.yml` 3-broker RF3 64-partition Kafka KRaft, `deploy/k8s/gamification-stage3.yaml` StatefulSet/HPA, `deploy/monitoring/` Prometheus rules, `deploy/scylla/schema.cql`, and `src/main/resources/application-stage3.yml`) are ready for multi-node 300k/1M sustained hardware soak testing.
 
 Across the three final 1M-event direct Kafka runs (concurrent with 8 HTTP leaderboard reader threads on the same Apple M4 host), end-to-end throughput measured `99,746.53`, `138,627.96`, and `98,800.41` events/s with pipeline backlog drain rates of `175k–201k` events/s, while a 500,000-event REST batch run measured `142,788.10` accepted events/s and `96,606.04` E2E events/s. Post-drain leaderboard p95 stayed at `0.27–1.05 ms` and under-load concurrent read p95 improved to `13.55–17.19 ms`.
 

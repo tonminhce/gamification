@@ -1,6 +1,7 @@
 package com.vnpt.einvoice.gamification.streams;
 
 import com.vnpt.einvoice.gamification.event.InvoiceIssuedEvent;
+import com.vnpt.einvoice.gamification.ledger.DedupeLedger;
 import com.vnpt.einvoice.gamification.metrics.RewardMetrics;
 import org.apache.kafka.common.header.internals.RecordHeaders;
 import org.apache.kafka.streams.KeyValue;
@@ -8,6 +9,7 @@ import org.apache.kafka.streams.kstream.Windowed;
 import org.apache.kafka.streams.processor.api.Processor;
 import org.apache.kafka.streams.processor.api.ProcessorContext;
 import org.apache.kafka.streams.processor.api.Record;
+import org.apache.kafka.streams.processor.api.RecordMetadata;
 import org.apache.kafka.streams.state.KeyValueIterator;
 import org.apache.kafka.streams.state.WindowStore;
 import org.apache.kafka.streams.state.WindowStoreIterator;
@@ -15,6 +17,8 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.nio.charset.StandardCharsets;
+import java.time.Duration;
+import java.time.Instant;
 import java.util.Arrays;
 import java.util.Objects;
 
@@ -38,6 +42,7 @@ public class DedupeProcessor implements Processor<String, InvoiceIssuedEvent, St
     private final long retentionMs;
     private final int bloomExpectedInsertions;
     private final RewardMetrics metrics;
+    private final DedupeLedger externalLedger;
 
     private ProcessorContext<String, InvoiceIssuedEvent> context;
     private WindowStore<String, String> store;
@@ -45,17 +50,32 @@ public class DedupeProcessor implements Processor<String, InvoiceIssuedEvent, St
     private long maxObservedTimestamp = Long.MIN_VALUE;
 
     public DedupeProcessor(long retentionMs, int bloomExpectedInsertions, RewardMetrics metrics) {
+        this(retentionMs, bloomExpectedInsertions, metrics, null);
+    }
+
+    public DedupeProcessor(
+            long retentionMs,
+            int bloomExpectedInsertions,
+            RewardMetrics metrics,
+            DedupeLedger externalLedger
+    ) {
         this.retentionMs = Math.max(1_000L, retentionMs);
         this.bloomExpectedInsertions = Math.max(1_024, bloomExpectedInsertions);
         this.metrics = Objects.requireNonNull(metrics);
+        this.externalLedger = externalLedger;
     }
 
     @Override
     public void init(ProcessorContext<String, InvoiceIssuedEvent> context) {
         this.context = context;
+        this.maxObservedTimestamp = Long.MIN_VALUE;
+        if (externalLedger != null) {
+            this.store = null;
+            this.seen = null;
+            return;
+        }
         this.store = context.getStateStore(STORE);
         this.seen = new TimeBucketedBloomFilter(bloomExpectedInsertions, retentionMs);
-        this.maxObservedTimestamp = Long.MIN_VALUE;
 
         try (KeyValueIterator<Windowed<String>, String> iterator = store.all()) {
             while (iterator.hasNext()) {
@@ -95,6 +115,11 @@ public class DedupeProcessor implements Processor<String, InvoiceIssuedEvent, St
             return;
         }
 
+        if (externalLedger != null) {
+            processWithExternalLedger(record, invoiceId, event, eventTs);
+            return;
+        }
+
         if (!seen.mightContain(invoiceId, cutoff)) {
             metrics.recordBloomNegativeSkip();
             claimAndForward(record, invoiceId, event.companyId(), eventTs);
@@ -121,6 +146,53 @@ public class DedupeProcessor implements Processor<String, InvoiceIssuedEvent, St
                 event.companyId()
         );
         forwardToDlt(record, CONFLICT_VALUE);
+    }
+
+    private void processWithExternalLedger(
+            Record<String, InvoiceIssuedEvent> record,
+            String invoiceId,
+            InvoiceIssuedEvent event,
+            long eventTs
+    ) {
+        String sourceId = resolveSourceId(event);
+        DedupeLedger.ClaimResult claim = externalLedger.claim(
+                invoiceId,
+                event.companyId(),
+                sourceId,
+                Instant.ofEpochMilli(eventTs),
+                Duration.ofMillis(retentionMs)
+        );
+        switch (claim.status()) {
+            case CLAIMED_NEW -> {
+                metrics.recordDedupeUnique();
+                context.forward(record, RewardTopology.REKEY_BY_COMPANY);
+                externalLedger.markEmitted(invoiceId, sourceId, Instant.now());
+            }
+            case RECOVERABLE_CLAIMED_UNEMITTED -> {
+                metrics.recordDedupeLedgerRecovered();
+                context.forward(record, RewardTopology.REKEY_BY_COMPANY);
+                externalLedger.markEmitted(invoiceId, sourceId, Instant.now());
+            }
+            case DUPLICATE_EMITTED, IN_FLIGHT_CLAIMED_BY_OTHER -> metrics.recordDedupeDuplicate();
+            case CONFLICT -> {
+                metrics.recordDedupeConflict();
+                log.warn(
+                        "Invoice conflict rejected by external ledger: invoiceId={} existingCompany={} incomingCompany={}",
+                        invoiceId,
+                        claim.existingCompanyId(),
+                        event.companyId()
+                );
+                forwardToDlt(record, CONFLICT_VALUE);
+            }
+        }
+    }
+
+    private String resolveSourceId(InvoiceIssuedEvent event) {
+        RecordMetadata metadata = context.recordMetadata().orElse(null);
+        if (metadata != null) {
+            return metadata.partition() + ":" + metadata.offset();
+        }
+        return event.eventId() != null ? event.eventId() : "local";
     }
 
     private void claimAndForward(

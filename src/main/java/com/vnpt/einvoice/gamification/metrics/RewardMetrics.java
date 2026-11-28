@@ -19,12 +19,14 @@ public class RewardMetrics {
     private final Counter invoicesPublished;
     private final Counter invoicesPublishFailed;
     private final Counter invoicesRejectedOverload;
+    private final Counter circuitBreakerRejected;
     private final Timer publishLatency;
 
     private final Counter dedupeUnique;
     private final Counter dedupeDuplicate;
     private final Counter dedupeConflict;
     private final Counter dedupeExpired;
+    private final Counter dedupeLedgerRecovered;
     private final Counter bloomNegativeSkip;
     private final Counter bloomHit;
 
@@ -36,11 +38,15 @@ public class RewardMetrics {
     private final Counter projectorDeltasSkipped;
     private final Timer projectorApplyLatency;
 
+    private final Counter snapshotsCaptured;
+    private final Counter snapshotsRebuilt;
+
     public RewardMetrics(MeterRegistry registry) {
         this.invoicesAccepted = registry.counter("gamification.invoice.accepted");
         this.invoicesPublished = registry.counter("gamification.invoice.published");
         this.invoicesPublishFailed = registry.counter("gamification.invoice.publish.failed");
         this.invoicesRejectedOverload = registry.counter("gamification.invoice.rejected.overload");
+        this.circuitBreakerRejected = registry.counter("gamification.ingest.circuit.rejected");
         this.publishLatency = Timer.builder("gamification.invoice.publish.latency")
                 .register(registry);
 
@@ -48,6 +54,7 @@ public class RewardMetrics {
         this.dedupeDuplicate = registry.counter("gamification.streams.dedupe.duplicate");
         this.dedupeConflict = registry.counter("gamification.streams.dedupe.conflict");
         this.dedupeExpired = registry.counter("gamification.streams.dedupe.expired");
+        this.dedupeLedgerRecovered = registry.counter("gamification.streams.dedupe.ledger.recovered");
         this.bloomNegativeSkip = registry.counter("gamification.streams.dedupe.bloom_skip");
         this.bloomHit = registry.counter("gamification.streams.dedupe.bloom_hit");
 
@@ -60,6 +67,9 @@ public class RewardMetrics {
         this.projectorApplyLatency = Timer.builder("gamification.projector.apply.latency")
                 .publishPercentileHistogram()
                 .register(registry);
+
+        this.snapshotsCaptured = registry.counter("gamification.snapshot.captured");
+        this.snapshotsRebuilt = registry.counter("gamification.snapshot.rebuilt");
     }
 
     public static RewardMetrics noop() {
@@ -94,8 +104,16 @@ public class RewardMetrics {
         invoicesRejectedOverload.increment(count);
     }
 
+    public void recordCircuitRejected(int count) {
+        circuitBreakerRejected.increment(count);
+    }
+
     public void recordDedupeUnique() {
         dedupeUnique.increment();
+    }
+
+    public void recordDedupeLedgerRecovered() {
+        dedupeLedgerRecovered.increment();
     }
 
     public void recordDedupeDuplicate() {
@@ -131,5 +149,13 @@ public class RewardMetrics {
             projectorDeltasSkipped.increment(skipped);
         }
         projectorApplyLatency.record(elapsedNanos, TimeUnit.NANOSECONDS);
+    }
+
+    public void recordSnapshotCaptured() {
+        snapshotsCaptured.increment();
+    }
+
+    public void recordSnapshotRebuilt() {
+        snapshotsRebuilt.increment();
     }
 }

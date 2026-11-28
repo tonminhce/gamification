@@ -2,6 +2,7 @@ package com.vnpt.einvoice.gamification.streams;
 
 import com.vnpt.einvoice.gamification.event.CompanyRewardDelta;
 import com.vnpt.einvoice.gamification.event.InvoiceIssuedEvent;
+import com.vnpt.einvoice.gamification.ledger.DedupeLedger;
 import com.vnpt.einvoice.gamification.metrics.RewardMetrics;
 import org.apache.kafka.common.serialization.Serdes;
 import org.apache.kafka.streams.StreamsBuilder;
@@ -53,6 +54,30 @@ public final class RewardTopology {
             long punctuationMs,
             RewardMetrics metrics
     ) {
+        return build(
+                sourceTopic,
+                deltaTopic,
+                dltTopic,
+                dedupeRetentionMs,
+                bloomExpectedInsertions,
+                windowSizeMs,
+                punctuationMs,
+                metrics,
+                null
+        );
+    }
+
+    public static Topology build(
+            String sourceTopic,
+            String deltaTopic,
+            String dltTopic,
+            long dedupeRetentionMs,
+            int bloomExpectedInsertions,
+            long windowSizeMs,
+            long punctuationMs,
+            RewardMetrics metrics,
+            DedupeLedger externalLedger
+    ) {
         JsonMapper mapper = JsonMapper.builder().build();
         JacksonJsonSerde<InvoiceIssuedEvent> invoiceSerde =
                 new JacksonJsonSerde<>(InvoiceIssuedEvent.class, mapper).noTypeInfo();
@@ -61,16 +86,6 @@ public final class RewardTopology {
 
         long effectiveRetentionMs = Math.max(1_000L, dedupeRetentionMs);
         Duration retention = Duration.ofMillis(effectiveRetentionMs);
-        StoreBuilder<?> dedupeStore = Stores.windowStoreBuilder(
-                Stores.persistentWindowStore(
-                        DedupeProcessor.STORE,
-                        retention,
-                        retention,
-                        false
-                ),
-                Serdes.String(),
-                Serdes.String()
-        );
         StoreBuilder<?> windowStore = Stores.keyValueStoreBuilder(
                 Stores.persistentKeyValueStore(WindowAggregatorProcessor.STORE),
                 Serdes.ByteArray(),
@@ -78,8 +93,21 @@ public final class RewardTopology {
         ).withCachingEnabled();
 
         StreamsBuilder builder = new StreamsBuilder();
-        builder.addStateStore(dedupeStore);
+        if (externalLedger == null) {
+            StoreBuilder<?> dedupeStore = Stores.windowStoreBuilder(
+                    Stores.persistentWindowStore(
+                            DedupeProcessor.STORE,
+                            retention,
+                            retention,
+                            false
+                    ),
+                    Serdes.String(),
+                    Serdes.String()
+            );
+            builder.addStateStore(dedupeStore);
+        }
         builder.addStateStore(windowStore);
+        String[] dedupeStoreNames = externalLedger == null ? new String[]{DedupeProcessor.STORE} : new String[0];
 
         KStream<String, InvoiceIssuedEvent> source = builder
                 .stream(sourceTopic, Consumed.with(Serdes.String(), invoiceSerde));
@@ -97,10 +125,11 @@ public final class RewardTopology {
                                         () -> new DedupeProcessor(
                                                 effectiveRetentionMs,
                                                 bloomExpectedInsertions,
-                                                metrics
+                                                metrics,
+                                                externalLedger
                                         ),
                                         Named.as(DEDUPE_PROCESSOR),
-                                        DedupeProcessor.STORE
+                                        dedupeStoreNames
                                 )
                                 .selectKey((invoiceId, event) -> event.companyId(), Named.as(REKEY_BY_COMPANY))
                                 .process(

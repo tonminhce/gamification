@@ -59,6 +59,11 @@ public class ApiExceptionHandler {
         return error(HttpStatus.UNSUPPORTED_MEDIA_TYPE, "Content-Type must be application/json");
     }
 
+    @ExceptionHandler(IllegalArgumentException.class)
+    ResponseEntity<ApiErrorResponse> handleIllegalArgument(IllegalArgumentException ex) {
+        return error(HttpStatus.BAD_REQUEST, ex.getMessage());
+    }
+
     @ExceptionHandler(NoResourceFoundException.class)
     ResponseEntity<ApiErrorResponse> handleNoResource(NoResourceFoundException ex) {
         return error(HttpStatus.NOT_FOUND, "Resource not found");

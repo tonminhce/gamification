@@ -78,6 +78,8 @@ app:
     rocksdb-block-cache-mb: 256
     rocksdb-write-buffer-mb: 16
   dedupe:
+    mode: ${APP_DEDUPE_MODE:streams-rocksdb}
+    claim-lease-ms: 5000
     retention-ms: 86400000
     bloom-expected-insertions: 4000000
   window:
@@ -85,12 +87,21 @@ app:
     punctuation-ms: 100
   ingest:
     max-in-flight: 200000
+    ack-mode: ${APP_INGEST_ACK_MODE:async}
+    ack-timeout-ms: 5000
+    circuit-breaker:
+      enabled: true
+      failure-threshold: 20
+      open-duration-ms: 5000
+      half-open-max-probes: 5
   leaderboard:
     key: einv:leaderboard
     processed-delta-set: "einv:processed-deltas"
     top-cache-ttl-ms: 50
   reward:
     batch-marker-ttl-seconds: 604800
+  snapshot:
+    dir: ${SNAPSHOT_DIR:./data/snapshots}
 
 logging:
   level:

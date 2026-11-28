@@ -1,0 +1,38 @@
+groups:
+  - name: gamification-stage3-slo
+    rules:
+      - alert: GamificationKafkaPublishFailures
+        expr: increase(gamification_invoice_publish_failed_total[1m]) > 0
+        for: 30s
+        labels:
+          severity: critical
+        annotations:
+          summary: "Kafka publish failures detected on REST ingress"
+          description: "Accepted invoice sends failed asynchronously or timed out in ack wait."
+
+      - alert: GamificationIngestCircuitBreakerOpen
+        expr: increase(gamification_ingest_circuit_rejected_total[1m]) > 0
+        for: 15s
+        labels:
+          severity: critical
+        annotations:
+          summary: "REST ingress circuit breaker rejected requests"
+          description: "Kafka broker latency/failures tripped PublishCircuitBreaker to OPEN."
+
+      - alert: GamificationProjectorApplyLatencyHigh
+        expr: histogram_quantile(0.95, sum(rate(gamification_projector_apply_latency_seconds_bucket[1m])) by (le)) > 0.010
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Redis Lua projector batch P95 exceeds 10ms"
+          description: "Hot ZSET or Redis CPU contention degraded batch apply latency."
+
+      - alert: GamificationInvoiceConflictSpike
+        expr: rate(gamification_streams_dedupe_conflict_total[5m]) > 1
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Elevated invoice-company conflicts routed to DLT"
+          description: "Duplicate invoiceIds arriving with mismatched companyId."

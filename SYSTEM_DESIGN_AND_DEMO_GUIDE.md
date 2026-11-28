@@ -143,7 +143,7 @@ Use these formulas on the whiteboard when your Tech Lead asks *"How do we take t
 Run every command from the repo root. (If ports `8080/9092/6379` are free on your machine, omit the `19092/16379/18080` overrides.)
 
 ### Step 1: Show Automated Proof First (2 minutes)
-Point out that we don't just test with mocks—we run **49 automated tests** including **real Kafka 4.4.0 + Redis 7.4 via Testcontainers**:
+Point out that we don't just test with mocks—we run **56 automated tests** including **real Kafka 4.4.0 + Redis 7.4 via Testcontainers** (plus aborted-transaction chaos, `FLUSHDB` snapshot/cold rebuilds, and external LWT CAS tests):
 ```bash
 export JAVA_HOME=$(/usr/libexec/java_home -v 25)
 mvn test
@@ -238,3 +238,20 @@ Point out on screen:
    - *Answer:* "At ingress, `max.block.ms=2000` and a bounded `Semaphore` (`max-in-flight`) shed excess load immediately with `503 + Retry-After: 1` instead of letting Tomcat or JVM heap OOM. At the projector, Redis failures leave Kafka offsets uncommitted and retry with backoff (`FixedBackOff`) until Redis recovers; on recovery, the `PENDING` marker + offset checkpoint + daily delta Sets ensure zero lost or double-counted points."
 6. **"How does Redis handle 10,000 leaderboard reads/s while applying writes?"**
    - *Answer:* "First, we aggregate 1,500+ raw invoices into a single Redis Lua call so Redis spends almost no time on writes. Second, `rank` and `summary` use a single-RTT atomic Lua script (`rank_and_score.lua`). Third, `top()` uses a non-blocking single-flight micro-cache (`50 ms` TTL) so 10,000 read RPS results in only 20 Redis `ZREVRANGE` calls/s."
+
+---
+
+## 7. Stage 3 Operational & Resilience Capabilities (Live Demo Extras)
+
+Use these points when your Tech Lead asks about **multi-region/K8s production readiness, disaster recovery (`FLUSHDB`), RPO=0 ingress, and partition scaling**:
+
+1. **Snapshot + Partition-Offset Manifest + Rebuild (`POST /api/admin/snapshots` & `/rebuild`):**
+   - Redis uses async AOF and is never the source of truth. `captureSnapshot()` atomically captures the `ZSET` and all `N` partition checkpoints (`einv:projector-checkpoint:{topic}:{p}`, falling back to Kafka committed consumer group offsets for idle partitions) + processed delta markers.
+   - Even after a total `redis-cli FLUSHDB`, `POST /api/admin/snapshots/rebuild` (or `?cold=true` from Kafka topic retention) pauses the projector listener, restores the barrier + delta markers, replays Kafka suffix records with `isolation.level=read_committed`, and recovers **100% exact points in ~583 ms** in our local benchmark.
+2. **Dual Ingress Durability + Circuit Breaker (`PublishCircuitBreaker`, `app.ingest.ack-mode`):**
+   - `async` (default): `261k accepted/s` on Virtual Threads (fast when upstream e-Invoice DB already persisted the invoice).
+   - `broker-ack`: awaits `CompletableFuture.allOf(batchFutures)` on Virtual Threads—only **1 `acks=all` broker RTT per 1,000 invoices**, delivering **`67.6k–108.5k durable accepted/s`** with **RPO = 0** before returning `202 DURABLE`!
+   - `PublishCircuitBreaker` + `Semaphore` shed stalled brokers immediately in microseconds (`503 Retry-After: 1`).
+3. **Why Local RocksDB Beats Synchronous External LWT for Raw Throughput (`101.9k/s` vs `4.5k/s`):**
+   - Enabling `APP_DEDUPE_MODE=external-ledger` activates `RedisLwtDedupeLedger` (`CLAIMED -> EMITTED` atomic Lua CAS, zero local RocksDB dedupe state, schema template in `deploy/scylla/schema.cql`) so `invoice-events` can scale from 12 -> 64 -> 128 partitions without state migration—at the measured cost of **2 external network RTTs per invoice (`4,513/s` vs `101,939/s` on local RocksDB+Bloom)**.
+   - Run the full Stage 3 Benchmark Contract (`offered / accepted / durable / processed / applied` + freshness p95 + `droppedIterations`) anytime via `scripts/Stage3LoadBenchmark.java`.

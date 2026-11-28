@@ -1,5 +1,6 @@
 package com.vnpt.einvoice.gamification.config;
 
+import com.vnpt.einvoice.gamification.ledger.DedupeLedger;
 import com.vnpt.einvoice.gamification.metrics.RewardMetrics;
 import com.vnpt.einvoice.gamification.streams.RewardTopology;
 import org.apache.kafka.clients.consumer.ConsumerConfig;
@@ -12,6 +13,7 @@ import org.apache.kafka.streams.errors.LogAndContinueExceptionHandler;
 import org.apache.kafka.streams.errors.StreamsUncaughtExceptionHandler;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.boot.health.contributor.Health;
 import org.springframework.boot.health.contributor.HealthIndicator;
@@ -38,8 +40,13 @@ public class RewardStreamsConfig {
             @Value("${app.dedupe.bloom-expected-insertions:4000000}") int bloomExpectedInsertions,
             @Value("${app.window.size-ms:500}") long windowSizeMs,
             @Value("${app.window.punctuation-ms:100}") long punctuationMs,
-            RewardMetrics metrics
+            RewardMetrics metrics,
+            @Autowired(required = false) DedupeLedger externalLedger
     ) {
+        if (externalLedger != null) {
+            log.info("RewardTopology initialized in Stage 3 external-ledger dedupe mode ({})",
+                    externalLedger.getClass().getSimpleName());
+        }
         return RewardTopology.build(
                 sourceTopic,
                 deltaTopic,
@@ -48,7 +55,8 @@ public class RewardStreamsConfig {
                 bloomExpectedInsertions,
                 windowSizeMs,
                 punctuationMs,
-                metrics
+                metrics,
+                externalLedger
         );
     }
 
@@ -58,6 +66,7 @@ public class RewardStreamsConfig {
             KafkaConnectionDetails connectionDetails,
             @Value("${app.streams.application-id}") String applicationId,
             @Value("${app.streams.threads}") int threads,
+            @Value("${app.streams.standby-replicas:0}") int standbyReplicas,
             @Value("${app.streams.commit-interval-ms}") long commitIntervalMs,
             @Value("${app.streams.state-dir}") String stateDir,
             @Value("${app.kafka.replication-factor:1}") int replicationFactor,
@@ -77,6 +86,9 @@ public class RewardStreamsConfig {
         properties.put(StreamsConfig.COMMIT_INTERVAL_MS_CONFIG, commitIntervalMs);
         properties.put(StreamsConfig.REPLICATION_FACTOR_CONFIG, replicationFactor);
         properties.put(StreamsConfig.NUM_STREAM_THREADS_CONFIG, threads);
+        if (standbyReplicas > 0) {
+            properties.put(StreamsConfig.NUM_STANDBY_REPLICAS_CONFIG, standbyReplicas);
+        }
         properties.put(StreamsConfig.STATE_DIR_CONFIG, stateDir);
         properties.put(StreamsConfig.DEFAULT_KEY_SERDE_CLASS_CONFIG, Serdes.StringSerde.class);
         properties.put(StreamsConfig.DEFAULT_VALUE_SERDE_CLASS_CONFIG, Serdes.StringSerde.class);
