@@ -20,34 +20,61 @@ end
 
 local batchMaxOffset = tonumber(ARGV[3]) or -1
 
-local function applyBatch(batch, verifyBefore)
-    for _, bucket in ipairs(batch.buckets) do
-        local ids = bucket.ids
-        for startIndex = 1, #ids, 1000 do
-            local chunk = {}
-            for index = startIndex, math.min(startIndex + 999, #ids) do
-                chunk[#chunk + 1] = ids[index]
-            end
-            redis.call('SADD', bucket.key, unpack(chunk))
+local function advanceCheckpoint(checkpointKey, maxOffset, lastOffset, ttl)
+    if maxOffset >= 0 and (lastOffset == nil or maxOffset > lastOffset) then
+        redis.call('SET', checkpointKey, tostring(maxOffset), 'EX', ttl)
+    end
+end
+
+local function chunkedSadd(bucketKey, ids, ttl)
+    for startIndex = 1, #ids, 1000 do
+        local chunk = {}
+        for index = startIndex, math.min(startIndex + 999, #ids) do
+            chunk[#chunk + 1] = ids[index]
         end
-        redis.call('EXPIRE', bucket.key, markerTtl)
+        redis.call('SADD', bucketKey, unpack(chunk))
+    end
+    redis.call('EXPIRE', bucketKey, ttl)
+end
+
+local function verifyRecoveryScores(companies)
+    for _, company in ipairs(companies) do
+        local scoreValue = redis.call('ZSCORE', KEYS[1], company.companyId)
+        local currentScore = scoreValue and tonumber(scoreValue) or 0
+        local scoreBefore = tonumber(company.scoreBefore)
+        local scoreAfter = scoreBefore + tonumber(company.deltaPoints)
+        if currentScore ~= scoreBefore and currentScore ~= scoreAfter then
+            return redis.error_reply('partial delta batch requires reconciliation')
+        end
+    end
+    return nil
+end
+
+local function applyBatch(batch, verifyBefore)
+    -- Validate all recovery expectations BEFORE mutating Redis, since Lua errors do not roll back writes.
+    if verifyBefore then
+        local validationErr = verifyRecoveryScores(batch.companies)
+        if validationErr then
+            return validationErr
+        end
+    end
+
+    for _, bucket in ipairs(batch.buckets) do
+        chunkedSadd(bucket.key, bucket.ids, markerTtl)
     end
 
     for _, company in ipairs(batch.companies) do
         if verifyBefore then
             local scoreValue = redis.call('ZSCORE', KEYS[1], company.companyId)
             local currentScore = scoreValue and tonumber(scoreValue) or 0
-            local scoreBefore = tonumber(company.scoreBefore)
-            local scoreAfter = scoreBefore + tonumber(company.deltaPoints)
-            if currentScore == scoreBefore then
+            if currentScore == tonumber(company.scoreBefore) then
                 redis.call('ZINCRBY', KEYS[1], company.deltaPoints, company.companyId)
-            elseif currentScore ~= scoreAfter then
-                return redis.error_reply('partial delta batch requires reconciliation')
             end
         else
             redis.call('ZINCRBY', KEYS[1], company.deltaPoints, company.companyId)
         end
     end
+    return nil
 end
 
 local markerValue = redis.call('GET', KEYS[2])
@@ -74,13 +101,18 @@ local hasCandidate = false
 for index = 4, #ARGV, 5 do
     local offset = tonumber(ARGV[index])
     local deltaId = ARGV[index + 1]
+    local points = tonumber(ARGV[index + 3])
+    if not points or points <= 0 then
+        return redis.error_reply('delta points must be positive')
+    end
+    local bucketIdx = tonumber(ARGV[index + 4])
+    if not bucketIdx or bucketIdx < 1 or bucketIdx > bucketCount then
+        return redis.error_reply('bucket index out of range')
+    end
+
     local skipByOffset = lastAppliedOffset ~= nil and offset ~= nil and offset >= 0 and offset <= lastAppliedOffset
     if not skipByOffset and not seen[deltaId] then
         seen[deltaId] = true
-        local bucketIdx = tonumber(ARGV[index + 4])
-        if not bucketIdx or bucketIdx < 1 or bucketIdx > bucketCount then
-            return redis.error_reply('bucket index out of range')
-        end
         local bucketList = byBucket[bucketIdx]
         if not bucketList then
             bucketList = {}
@@ -89,17 +121,14 @@ for index = 4, #ARGV, 5 do
         bucketList[#bucketList + 1] = {
             deltaId = deltaId,
             companyId = ARGV[index + 2],
-            points = tonumber(ARGV[index + 3]),
-            bucketIdx = bucketIdx
+            points = points
         }
         hasCandidate = true
     end
 end
 
 if not hasCandidate then
-    if batchMaxOffset >= 0 and (lastAppliedOffset == nil or batchMaxOffset > lastAppliedOffset) then
-        redis.call('SET', KEYS[3], tostring(batchMaxOffset), 'EX', markerTtl)
-    end
+    advanceCheckpoint(KEYS[3], batchMaxOffset, lastAppliedOffset, markerTtl)
     return 0
 end
 
@@ -133,9 +162,7 @@ for bucketIdx = 1, bucketCount do
 end
 
 if #newDeltas == 0 then
-    if batchMaxOffset >= 0 and (lastAppliedOffset == nil or batchMaxOffset > lastAppliedOffset) then
-        redis.call('SET', KEYS[3], tostring(batchMaxOffset), 'EX', markerTtl)
-    end
+    advanceCheckpoint(KEYS[3], batchMaxOffset, lastAppliedOffset, markerTtl)
     return 0
 end
 
@@ -182,8 +209,6 @@ local applyErr = applyBatch(batch, false)
 if applyErr then
     return applyErr
 end
-if batchMaxOffset >= 0 and (lastAppliedOffset == nil or batchMaxOffset > lastAppliedOffset) then
-    redis.call('SET', KEYS[3], tostring(batchMaxOffset), 'EX', markerTtl)
-end
+advanceCheckpoint(KEYS[3], batchMaxOffset, lastAppliedOffset, markerTtl)
 redis.call('DEL', KEYS[2])
 return #newDeltas

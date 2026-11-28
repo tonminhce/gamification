@@ -20,11 +20,11 @@ import java.util.Objects;
 
 /**
  * Partition-local exact invoice deduplicator backed by a bounded-retention RocksDB WindowStore
- * and a two-generation rotating primitive Bloom filter negative cache.
+ * and a 3-generation time-bucketed primitive Bloom filter negative cache.
  *
- * <p>First-seen invoices skip RocksDB lookups on Bloom miss; Bloom hits always verify against the
- * persistent store so false positives never drop valid invoices. Conflicts (same invoiceId for a
- * different companyId) are flagged via {@link #CONFLICT_HEADER} for DLT quarantine without double award.
+ * <p>First-seen invoices skip RocksDB lookups on Bloom miss; Bloom hits (and saturated buckets)
+ * always verify against the persistent store so false positives never drop valid invoices.
+ * Out-of-retention timestamps and invoice-company conflicts are quarantined to DLT without award.
  */
 public class DedupeProcessor implements Processor<String, InvoiceIssuedEvent, String, InvoiceIssuedEvent> {
 
@@ -33,6 +33,7 @@ public class DedupeProcessor implements Processor<String, InvoiceIssuedEvent, St
     static final String STORE = "invoice-dedupe-store";
     static final String CONFLICT_HEADER = "x-dlt-reason";
     static final byte[] CONFLICT_VALUE = "INVOICE_COMPANY_CONFLICT".getBytes(StandardCharsets.UTF_8);
+    static final byte[] EXPIRED_VALUE = "EXPIRED_INVOICE_TIMESTAMP".getBytes(StandardCharsets.UTF_8);
 
     private final long retentionMs;
     private final int bloomExpectedInsertions;
@@ -40,11 +41,11 @@ public class DedupeProcessor implements Processor<String, InvoiceIssuedEvent, St
 
     private ProcessorContext<String, InvoiceIssuedEvent> context;
     private WindowStore<String, String> store;
-    private RotatingBloomFilter seen;
+    private TimeBucketedBloomFilter seen;
     private long maxObservedTimestamp = Long.MIN_VALUE;
 
     public DedupeProcessor(long retentionMs, int bloomExpectedInsertions, RewardMetrics metrics) {
-        this.retentionMs = Math.max(1L, retentionMs);
+        this.retentionMs = Math.max(1_000L, retentionMs);
         this.bloomExpectedInsertions = Math.max(1_024, bloomExpectedInsertions);
         this.metrics = Objects.requireNonNull(metrics);
     }
@@ -53,22 +54,18 @@ public class DedupeProcessor implements Processor<String, InvoiceIssuedEvent, St
     public void init(ProcessorContext<String, InvoiceIssuedEvent> context) {
         this.context = context;
         this.store = context.getStateStore(STORE);
-        this.seen = new RotatingBloomFilter(bloomExpectedInsertions, Math.max(1L, retentionMs / 2));
+        this.seen = new TimeBucketedBloomFilter(bloomExpectedInsertions, retentionMs);
+        this.maxObservedTimestamp = Long.MIN_VALUE;
 
-        // Single chronological pass restores the Bloom cache and recovers maxObservedTimestamp.
-        long restoredLatest = Long.MIN_VALUE;
         try (KeyValueIterator<Windowed<String>, String> iterator = store.all()) {
             while (iterator.hasNext()) {
                 KeyValue<Windowed<String>, String> entry = iterator.next();
                 long ts = entry.key.window().start();
-                if (ts > restoredLatest) {
-                    restoredLatest = ts;
+                if (ts > maxObservedTimestamp) {
+                    maxObservedTimestamp = ts;
                 }
                 seen.add(entry.key.key(), ts);
             }
-        }
-        if (restoredLatest != Long.MIN_VALUE) {
-            this.maxObservedTimestamp = restoredLatest;
         }
     }
 
@@ -86,7 +83,19 @@ public class DedupeProcessor implements Processor<String, InvoiceIssuedEvent, St
         }
         long cutoff = Math.max(0L, maxObservedTimestamp - retentionMs);
 
-        if (!seen.mightContain(invoiceId)) {
+        if (eventTs < cutoff) {
+            metrics.recordDedupeExpired();
+            log.warn(
+                    "Expired invoice rejected before store write: invoiceId={} eventTs={} cutoff={}",
+                    invoiceId,
+                    eventTs,
+                    cutoff
+            );
+            forwardToDlt(record, EXPIRED_VALUE);
+            return;
+        }
+
+        if (!seen.mightContain(invoiceId, cutoff)) {
             metrics.recordBloomNegativeSkip();
             claimAndForward(record, invoiceId, event.companyId(), eventTs);
             return;
@@ -111,13 +120,7 @@ public class DedupeProcessor implements Processor<String, InvoiceIssuedEvent, St
                 existingCompany,
                 event.companyId()
         );
-        RecordHeaders conflictHeaders = new RecordHeaders(record.headers());
-        conflictHeaders.remove(CONFLICT_HEADER);
-        conflictHeaders.add(CONFLICT_HEADER, CONFLICT_VALUE);
-        context.forward(
-                new Record<>(invoiceId, event, record.timestamp(), conflictHeaders),
-                RewardTopology.CONFLICT_DLT_SINK
-        );
+        forwardToDlt(record, CONFLICT_VALUE);
     }
 
     private void claimAndForward(
@@ -132,6 +135,16 @@ public class DedupeProcessor implements Processor<String, InvoiceIssuedEvent, St
         context.forward(record, RewardTopology.REKEY_BY_COMPANY);
     }
 
+    private void forwardToDlt(Record<String, InvoiceIssuedEvent> record, byte[] reason) {
+        RecordHeaders dltHeaders = new RecordHeaders(record.headers());
+        dltHeaders.remove(CONFLICT_HEADER);
+        dltHeaders.add(CONFLICT_HEADER, reason);
+        context.forward(
+                new Record<>(record.key(), record.value(), record.timestamp(), dltHeaders),
+                RewardTopology.CONFLICT_DLT_SINK
+        );
+    }
+
     private String findActiveClaim(String invoiceId, long cutoff, long upperBound) {
         try (WindowStoreIterator<String> iterator = store.fetch(invoiceId, cutoff, upperBound)) {
             if (iterator.hasNext()) {
@@ -142,68 +155,98 @@ public class DedupeProcessor implements Processor<String, InvoiceIssuedEvent, St
     }
 
     /**
-     * Two-generation rotating Bloom filter backed by primitive long arrays.
-     * Prevents bit saturation over unbounded runtimes without per-element deletion.
+     * Three-bucket time-partitioned Bloom filter with 64-bit FNV-1a character hashing and
+     * count-saturation fallback. Guarantees zero false negatives over the full retention window
+     * even under non-chronological RocksDB restores or insertion spikes exceeding sizing hints.
      */
-    private static final class RotatingBloomFilter {
+    private static final class TimeBucketedBloomFilter {
 
-        private final int wordCount;
+        private static final int BUCKET_COUNT = 3;
+        private static final long MAX_BITS_PER_BUCKET = 1L << 29;
+
+        private final long bucketMs;
         private final int bitMask;
-        private final int maxInsertionsPerGen;
-        private final long rotationIntervalMs;
+        private final int maxSafeInsertions;
+        private final BloomBucket[] buckets = new BloomBucket[BUCKET_COUNT];
+        private long highestBucketId = Long.MIN_VALUE;
 
-        private long[] currentWords;
-        private long[] previousWords;
-        private int currentInsertions;
-        private long currentGenStartTs = Long.MIN_VALUE;
-
-        RotatingBloomFilter(int expectedInsertionsPerGen, long rotationIntervalMs) {
-            int rawBits = Math.max(1024, expectedInsertionsPerGen * 10);
-            int bitCapacity = Integer.highestOneBit(rawBits - 1) << 1;
-            if (bitCapacity <= 0) {
-                bitCapacity = 1 << 26;
+        TimeBucketedBloomFilter(int expectedInsertionsPerGen, long retentionMs) {
+            this.bucketMs = Math.max(1L, (retentionMs + 1L) / 2L);
+            long rawBits = Math.max(1024L, (long) expectedInsertionsPerGen * 10L);
+            long capacity = Long.highestOneBit(rawBits - 1L) << 1;
+            if (capacity <= 0L || capacity > MAX_BITS_PER_BUCKET) {
+                capacity = MAX_BITS_PER_BUCKET;
             }
-            this.bitMask = bitCapacity - 1;
-            this.wordCount = bitCapacity >>> 6;
-            this.maxInsertionsPerGen = Math.max(512, expectedInsertionsPerGen);
-            this.rotationIntervalMs = Math.max(1L, rotationIntervalMs);
-            this.currentWords = new long[wordCount];
-            this.previousWords = new long[wordCount];
+            this.bitMask = (int) (capacity - 1L);
+            int wordCount = (int) (capacity >>> 6);
+            this.maxSafeInsertions = (int) Math.min(Integer.MAX_VALUE, Math.max(1_024L, (long) expectedInsertionsPerGen * 2L));
+            for (int i = 0; i < BUCKET_COUNT; i++) {
+                buckets[i] = new BloomBucket(wordCount);
+            }
         }
 
         void add(String key, long eventTs) {
-            if (currentGenStartTs == Long.MIN_VALUE) {
-                currentGenStartTs = eventTs;
-            } else if (currentInsertions >= maxInsertionsPerGen
-                    || (eventTs - currentGenStartTs) >= rotationIntervalMs) {
-                rotate(eventTs);
+            long targetBucketId = eventTs / bucketMs;
+            if (targetBucketId > highestBucketId) {
+                highestBucketId = targetBucketId;
+            }
+            long minRetainedBucket = highestBucketId - (BUCKET_COUNT - 1);
+            if (targetBucketId < minRetainedBucket) {
+                return;
             }
 
-            long h1 = mix64(key.hashCode());
+            BloomBucket bucket = resolveOrAssignBucket(targetBucketId, minRetainedBucket);
+            if (bucket == null || bucket.saturated) {
+                return;
+            }
+            if (bucket.insertions >= maxSafeInsertions) {
+                bucket.saturated = true;
+                return;
+            }
+
+            long h1 = hash64(key);
             long h2 = mix64(h1 ^ 0x9E3779B97F4A7C15L);
-            setBit(currentWords, (int) h1 & bitMask);
-            setBit(currentWords, (int) (h1 + h2) & bitMask);
-            setBit(currentWords, (int) (h1 + 2 * h2) & bitMask);
-            currentInsertions++;
+            setBit(bucket.words, (int) h1 & bitMask);
+            setBit(bucket.words, (int) (h1 + h2) & bitMask);
+            setBit(bucket.words, (int) (h1 + 2L * h2) & bitMask);
+            bucket.insertions++;
         }
 
-        boolean mightContain(String key) {
-            long h1 = mix64(key.hashCode());
+        boolean mightContain(String key, long cutoffTs) {
+            if (highestBucketId == Long.MIN_VALUE) {
+                return false;
+            }
+            long minActiveBucket = Math.max(0L, cutoffTs / bucketMs);
+            long h1 = hash64(key);
             long h2 = mix64(h1 ^ 0x9E3779B97F4A7C15L);
             int p1 = (int) h1 & bitMask;
             int p2 = (int) (h1 + h2) & bitMask;
-            int p3 = (int) (h1 + 2 * h2) & bitMask;
-            return containsAll(currentWords, p1, p2, p3)
-                    || containsAll(previousWords, p1, p2, p3);
+            int p3 = (int) (h1 + 2L * h2) & bitMask;
+
+            for (BloomBucket bucket : buckets) {
+                if (bucket.bucketId >= minActiveBucket) {
+                    if (bucket.saturated || containsAll(bucket.words, p1, p2, p3)) {
+                        return true;
+                    }
+                }
+            }
+            return false;
         }
 
-        private void rotate(long eventTs) {
-            long[] recycled = previousWords;
-            Arrays.fill(recycled, 0L);
-            previousWords = currentWords;
-            currentWords = recycled;
-            currentInsertions = 0;
-            currentGenStartTs = eventTs;
+        private BloomBucket resolveOrAssignBucket(long targetBucketId, long minRetainedBucket) {
+            BloomBucket reusable = null;
+            for (BloomBucket bucket : buckets) {
+                if (bucket.bucketId == targetBucketId) {
+                    return bucket;
+                }
+                if (reusable == null && bucket.bucketId < minRetainedBucket) {
+                    reusable = bucket;
+                }
+            }
+            if (reusable != null) {
+                reusable.reset(targetBucketId);
+            }
+            return reusable;
         }
 
         private static void setBit(long[] words, int bitIndex) {
@@ -216,10 +259,38 @@ public class DedupeProcessor implements Processor<String, InvoiceIssuedEvent, St
                     && ((words[p3 >>> 6] >>> p3) & 1L) != 0L;
         }
 
+        private static long hash64(String key) {
+            long hash = 0xCBF29CE484222325L;
+            int len = key.length();
+            for (int i = 0; i < len; i++) {
+                hash ^= key.charAt(i);
+                hash *= 0x100000001B3L;
+            }
+            return mix64(hash);
+        }
+
         private static long mix64(long z) {
             z = (z ^ (z >>> 30)) * 0xBF58476D1CE4E5B9L;
             z = (z ^ (z >>> 27)) * 0x94D049BB133111EBL;
             return z ^ (z >>> 31);
+        }
+
+        private static final class BloomBucket {
+            long bucketId = Long.MIN_VALUE;
+            final long[] words;
+            int insertions;
+            boolean saturated;
+
+            BloomBucket(int wordCount) {
+                this.words = new long[wordCount];
+            }
+
+            void reset(long newBucketId) {
+                Arrays.fill(words, 0L);
+                this.bucketId = newBucketId;
+                this.insertions = 0;
+                this.saturated = false;
+            }
         }
     }
 }

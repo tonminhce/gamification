@@ -24,6 +24,7 @@ public class RewardMetrics {
     private final Counter dedupeUnique;
     private final Counter dedupeDuplicate;
     private final Counter dedupeConflict;
+    private final Counter dedupeExpired;
     private final Counter bloomNegativeSkip;
     private final Counter bloomHit;
 
@@ -46,6 +47,7 @@ public class RewardMetrics {
         this.dedupeUnique = registry.counter("gamification.streams.dedupe.unique");
         this.dedupeDuplicate = registry.counter("gamification.streams.dedupe.duplicate");
         this.dedupeConflict = registry.counter("gamification.streams.dedupe.conflict");
+        this.dedupeExpired = registry.counter("gamification.streams.dedupe.expired");
         this.bloomNegativeSkip = registry.counter("gamification.streams.dedupe.bloom_skip");
         this.bloomHit = registry.counter("gamification.streams.dedupe.bloom_hit");
 
@@ -82,6 +84,12 @@ public class RewardMetrics {
         invoicesPublishFailed.increment();
     }
 
+    public void recordPublishFailed(int count) {
+        if (count > 0) {
+            invoicesPublishFailed.increment(count);
+        }
+    }
+
     public void recordRejectedOverload(int count) {
         invoicesRejectedOverload.increment(count);
     }
@@ -96,6 +104,10 @@ public class RewardMetrics {
 
     public void recordDedupeConflict() {
         dedupeConflict.increment();
+    }
+
+    public void recordDedupeExpired() {
+        dedupeExpired.increment();
     }
 
     public void recordBloomNegativeSkip() {

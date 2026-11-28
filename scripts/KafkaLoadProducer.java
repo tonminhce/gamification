@@ -1,3 +1,4 @@
+import com.vnpt.einvoice.gamification.event.InvoiceIssuedEvent;
 import org.apache.kafka.clients.producer.KafkaProducer;
 import org.apache.kafka.clients.producer.ProducerConfig;
 import org.apache.kafka.clients.producer.ProducerRecord;
@@ -5,8 +6,6 @@ import org.apache.kafka.common.serialization.StringSerializer;
 import org.springframework.kafka.support.serializer.JacksonJsonSerializer;
 import tools.jackson.databind.JsonNode;
 import tools.jackson.databind.json.JsonMapper;
-
-import com.vnpt.einvoice.gamification.event.InvoiceIssuedEvent;
 
 import java.net.URI;
 import java.net.http.HttpClient;
@@ -35,6 +34,9 @@ public class KafkaLoadProducer {
         String api = args.length > 4 ? args[4] : "http://localhost:8080";
         int duplicateReplayCount = args.length > 5 ? Integer.parseInt(args[5]) : Math.min(10_000, total);
         int concurrentReadThreads = args.length > 6 ? Integer.parseInt(args[6]) : 8;
+        if (companies < 1 || companies > 100) {
+            throw new IllegalArgumentException("companies must be between 1 and 100");
+        }
         String runId = "DIRECT-" + System.currentTimeMillis();
 
         JsonMapper mapper = JsonMapper.builder().build();
@@ -65,7 +67,7 @@ public class KafkaLoadProducer {
                 while (loadRunning.get()) {
                     try {
                         long t0 = System.nanoTime();
-                        leaderboardRequest(httpClient, api);
+                        getString(httpClient, api + "/api/leaderboard/top?limit=100");
                         concurrentReadLatencies.add((System.nanoTime() - t0) / 1_000_000.0);
                         Thread.sleep(5);
                     } catch (InterruptedException ignored) {
@@ -90,7 +92,7 @@ public class KafkaLoadProducer {
                 String invoiceId = runId + "-" + i;
                 String companyId = runId + "-COMPANY-" + (i % companies);
                 InvoiceIssuedEvent event = new InvoiceIssuedEvent(
-                        new UUID(rng.nextLong(), rng.nextLong()).toString(),
+                        fastUuid(rng),
                         InvoiceIssuedEvent.TYPE,
                         InvoiceIssuedEvent.SCHEMA_VERSION,
                         invoiceId,
@@ -125,8 +127,8 @@ public class KafkaLoadProducer {
             throw new IllegalStateException("Expected " + expectedTotalPoints + " points, observed " + observedTotalPoints);
         }
 
-        // Verify duplicate replay adds zero points
         if (duplicateReplayCount > 0) {
+            double dupBaseline = dedupeDuplicateCount(httpClient, mapper, api);
             List<Future<?>> dupFutures = new ArrayList<>(duplicateReplayCount);
             try (KafkaProducer<String, InvoiceIssuedEvent> dupProducer = new KafkaProducer<>(
                     properties,
@@ -134,11 +136,12 @@ public class KafkaLoadProducer {
                     new JacksonJsonSerializer<InvoiceIssuedEvent>(mapper).noTypeInfo()
             )) {
                 Instant dupTs = Instant.now();
+                ThreadLocalRandom rng = ThreadLocalRandom.current();
                 for (int i = 0; i < duplicateReplayCount; i++) {
                     String invoiceId = runId + "-" + i;
                     String companyId = runId + "-COMPANY-" + (i % companies);
                     InvoiceIssuedEvent event = new InvoiceIssuedEvent(
-                            UUID.randomUUID().toString(),
+                            fastUuid(rng),
                             InvoiceIssuedEvent.TYPE,
                             InvoiceIssuedEvent.SCHEMA_VERSION,
                             invoiceId,
@@ -151,7 +154,12 @@ public class KafkaLoadProducer {
                     f.get();
                 }
             }
-            Thread.sleep(1_500);
+            long dupDeadline = System.nanoTime() + Duration.ofSeconds(20).toNanos();
+            while (dedupeDuplicateCount(httpClient, mapper, api) < dupBaseline + duplicateReplayCount
+                    && System.nanoTime() < dupDeadline) {
+                Thread.sleep(50);
+            }
+            Thread.sleep(700);
             long afterDupPoints = totalPoints(httpClient, mapper, api);
             if (afterDupPoints != expectedTotalPoints) {
                 throw new IllegalStateException("Duplicate replay inflated points: " + afterDupPoints);
@@ -159,12 +167,12 @@ public class KafkaLoadProducer {
         }
 
         for (int i = 0; i < 20; i++) {
-            leaderboardRequest(httpClient, api);
+            getString(httpClient, api + "/api/leaderboard/top?limit=100");
         }
         List<Double> postDrainLatencies = new ArrayList<>(200);
         for (int i = 0; i < 200; i++) {
             long start = System.nanoTime();
-            leaderboardRequest(httpClient, api);
+            getString(httpClient, api + "/api/leaderboard/top?limit=100");
             postDrainLatencies.add((System.nanoTime() - start) / 1_000_000.0);
         }
         postDrainLatencies.sort(Comparator.naturalOrder());
@@ -196,12 +204,23 @@ public class KafkaLoadProducer {
         )));
     }
 
+    private static String fastUuid(ThreadLocalRandom rng) {
+        long msb = (rng.nextLong() & 0xFFFFFFFFFFFF0FFFL) | 0x0000000000004000L;
+        long lsb = (rng.nextLong() & 0x3FFFFFFFFFFFFFFFL) | 0x8000000000000000L;
+        return new UUID(msb, lsb).toString();
+    }
+
     private static double percentile(List<Double> sorted, double p) {
         return sorted.get(Math.min(sorted.size() - 1, Math.max(0, (int) Math.ceil(sorted.size() * p) - 1)));
     }
 
+    private static double dedupeDuplicateCount(HttpClient client, JsonMapper mapper, String api) throws Exception {
+        JsonNode body = mapper.readTree(getString(client, api + "/actuator/metrics/gamification.streams.dedupe.duplicate"));
+        return body.path("measurements").get(0).path("value").asDouble();
+    }
+
     private static long totalPoints(HttpClient client, JsonMapper mapper, String api) throws Exception {
-        JsonNode body = mapper.readTree(leaderboardRequest(client, api));
+        JsonNode body = mapper.readTree(getString(client, api + "/api/leaderboard/top?limit=100"));
         long points = 0;
         for (JsonNode entry : body.path("entries")) {
             points += entry.path("points").asLong();
@@ -209,14 +228,14 @@ public class KafkaLoadProducer {
         return points;
     }
 
-    private static String leaderboardRequest(HttpClient client, String api) throws Exception {
-        HttpRequest request = HttpRequest.newBuilder(URI.create(api + "/api/leaderboard/top?limit=100"))
+    private static String getString(HttpClient client, String url) throws Exception {
+        HttpRequest request = HttpRequest.newBuilder(URI.create(url))
                 .timeout(Duration.ofSeconds(5))
                 .GET()
                 .build();
         HttpResponse<String> response = client.send(request, HttpResponse.BodyHandlers.ofString());
         if (response.statusCode() != 200) {
-            throw new IllegalStateException("Leaderboard returned " + response.statusCode());
+            throw new IllegalStateException(url + " returned " + response.statusCode());
         }
         return response.body();
     }

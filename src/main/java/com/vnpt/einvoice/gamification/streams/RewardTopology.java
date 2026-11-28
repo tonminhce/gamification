@@ -59,7 +59,8 @@ public final class RewardTopology {
         JacksonJsonSerde<CompanyRewardDelta> deltaSerde =
                 new JacksonJsonSerde<>(CompanyRewardDelta.class, mapper).noTypeInfo();
 
-        Duration retention = Duration.ofMillis(Math.max(1_000L, dedupeRetentionMs));
+        long effectiveRetentionMs = Math.max(1_000L, dedupeRetentionMs);
+        Duration retention = Duration.ofMillis(effectiveRetentionMs);
         StoreBuilder<?> dedupeStore = Stores.windowStoreBuilder(
                 Stores.persistentWindowStore(
                         DedupeProcessor.STORE,
@@ -74,7 +75,7 @@ public final class RewardTopology {
                 Stores.persistentKeyValueStore(WindowAggregatorProcessor.STORE),
                 Serdes.ByteArray(),
                 Serdes.ByteArray()
-        );
+        ).withCachingEnabled();
 
         StreamsBuilder builder = new StreamsBuilder();
         builder.addStateStore(dedupeStore);
@@ -85,16 +86,16 @@ public final class RewardTopology {
 
         source.split()
                 .branch(
-                        (key, event) -> event != null && !valid(event),
+                        (key, event) -> event != null && !validRecord(key, event),
                         Branched.withConsumer(invalid ->
                                 invalid.to(dltTopic, Produced.with(Serdes.String(), invoiceSerde)))
                 )
                 .branch(
-                        (key, event) -> valid(event),
+                        RewardTopology::validRecord,
                         Branched.withConsumer(validEvents -> validEvents
                                 .process(
                                         () -> new DedupeProcessor(
-                                                dedupeRetentionMs,
+                                                effectiveRetentionMs,
                                                 bloomExpectedInsertions,
                                                 metrics
                                         ),
@@ -126,13 +127,15 @@ public final class RewardTopology {
         return topology;
     }
 
-    private static boolean valid(InvoiceIssuedEvent event) {
+    private static boolean validRecord(String key, InvoiceIssuedEvent event) {
         return event != null
                 && InvoiceIssuedEvent.TYPE.equals(event.eventType())
                 && event.schemaVersion() == InvoiceIssuedEvent.SCHEMA_VERSION
                 && event.invoiceId() != null
                 && !event.invoiceId().isBlank()
                 && event.companyId() != null
-                && !event.companyId().isBlank();
+                && !event.companyId().isBlank()
+                && key != null
+                && key.equals(event.invoiceId());
     }
 }

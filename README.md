@@ -74,7 +74,7 @@ Company points, rank, and discount are derived from the leaderboard; no duplicat
 - **Recoverable per-partition markers.** The projector stores a per-partition PENDING marker with a TTL, including pre-update scores, so a retry can distinguish “ZINCRBY did not happen” from “it happened before the marker was cleared”.
 - **Minimal DLT.** Invalid event types or missing fields are filtered by the topology into `invoice-events.DLT`; valid records in the same topic are still processed.
 - **Infinite retry in the POC.** A persistent Redis outage blocks the affected partition instead of skipping data. Production should use bounded retries and alerting.
-- **Bounded exact dedupe with 2-generation Bloom cache & conflict quarantine.** `DedupeProcessor` uses a bounded-retention RocksDB `WindowStore` (`24h` default) so old segments drop in O(1) disk unlink instead of growing forever, plus a 2-generation rotating primitive Bloom filter that avoids bit saturation and skips >99.999% of RocksDB reads. Same `invoiceId` with a different `companyId` is quarantined to `invoice-events.DLT` with header `x-dlt-reason=INVOICE_COMPANY_CONFLICT`.
+- **Bounded exact dedupe with 3-bucket Bloom cache, expiration & conflict quarantine.** `DedupeProcessor` uses a bounded-retention RocksDB `WindowStore` (`24h` default) so old segments drop in O(1) disk unlink instead of growing forever, plus a 3-bucket `TimeBucketedBloomFilter` (64-bit FNV-1a character hashing + saturation fallback to RocksDB) covering the full retention window and skipping >99.999% of RocksDB reads. Expired timestamps beyond `retentionMs` are quarantined with header `x-dlt-reason=EXPIRED_INVOICE_TIMESTAMP`, and same-`invoiceId` / different-`companyId` duplicates are quarantined to `invoice-events.DLT` with `x-dlt-reason=INVOICE_COMPANY_CONFLICT`.
 - **In-memory window index + deterministic `deltaId`.** `WindowAggregatorProcessor` tracks active 500 ms windows in a `TreeMap` synchronized with RocksDB (eliminating `store.all()` full scans and per-event `store.get()` calls) and emits sequence-numbered deterministic `deltaId`s (`partition:windowStart:companyId:seq`).
 - **Tuned RocksDB off-heap cache & compression.** `HighThroughputRocksDBConfig` configures a shared 256 MB `LRUCache`, 16 KB blocks, native SST Bloom filters, and `LZ4` compression (`31 MB` on disk for 3.61M keys).
 - **Admission control & observability.** `InvoiceEventPublisher` enforces a bounded `Semaphore` (`200,000` in-flight) returning `503 Service Unavailable` + `Retry-After: 1` when saturated, while `RewardMetrics` exposes full pipeline counters/timers at `/actuator/metrics` and `/actuator/prometheus`.
@@ -127,7 +127,6 @@ Company points, rank, and discount are derived from the leaderboard; no duplicat
     │   │   ├── exception/
     │   │   │   ├── ApiExceptionHandler.java
     │   │   │   ├── EventPublishException.java
-    │   │   │   ├── InvalidInvoiceEventException.java
     │   │   │   └── OverloadException.java
     │   │   ├── invoice/
     │   │   │   ├── InvoiceController.java
@@ -152,6 +151,7 @@ Company points, rank, and discount are derived from the leaderboard; no duplicat
     │           └── rank_and_score.lua
     └── test/java/com/vnpt/einvoice/gamification/
         ├── GamificationEndToEndIntegrationTest.java
+        ├── config/HighThroughputRocksDBConfigTest.java
         ├── exception/ApiExceptionHandlerTest.java
         ├── invoice/InvoiceEventPublisherTest.java
         ├── leaderboard/
@@ -169,7 +169,7 @@ Company points, rank, and discount are derived from the leaderboard; no duplicat
 | Producer settings, topics and typed `KafkaTemplate` | `src/main/resources/application.yml`, `src/main/java/com/vnpt/einvoice/gamification/config/KafkaConfig.java` |
 | Single/batch async publishing + backpressure | `src/main/java/com/vnpt/einvoice/gamification/invoice/InvoiceEventPublisher.java` |
 | Streams runtime, EOS_v2 and RocksDB tuning | `src/main/java/com/vnpt/einvoice/gamification/config/RewardStreamsConfig.java`, `HighThroughputRocksDBConfig.java` |
-| Topology, DLT, rotating Bloom + WindowStore dedupe, window index | `src/main/java/com/vnpt/einvoice/gamification/streams/RewardTopology.java`, `DedupeProcessor.java`, `WindowAggregatorProcessor.java` |
+| Topology, DLT, 3-bucket Bloom + WindowStore dedupe, window index | `src/main/java/com/vnpt/einvoice/gamification/streams/RewardTopology.java`, `DedupeProcessor.java`, `WindowAggregatorProcessor.java` |
 | Leaderboard delta projector + Lua | `src/main/java/com/vnpt/einvoice/gamification/leaderboard/LeaderboardProjector.java`, `LeaderboardApplyService.java`, `src/main/resources/scripts/apply_delta_batch.lua` |
 | Leaderboard, single-RTT rank, summary, micro-cache | `src/main/java/com/vnpt/einvoice/gamification/leaderboard/LeaderboardService.java`, `src/main/resources/scripts/rank_and_score.lua` |
 | Discount tiers | `src/main/java/com/vnpt/einvoice/gamification/leaderboard/DiscountService.java` |
@@ -377,11 +377,11 @@ export JAVA_HOME=$(/usr/libexec/java_home -v 25)
 mvn test
 ```
 
-Expected: **36 automated tests** (`mvn test`), 0 failures, 0 errors:
-- `GamificationEndToEndIntegrationTest` (Testcontainers real Kafka 4.4.0 + Redis 7.4 + full Spring Boot HTTP server): REST single/batch, competition ranking, discount tiers, duplicate replay, company conflict quarantine to DLT, poison-pill resilience, and live Micrometer metrics.
-- `LeaderboardApplyServiceIntegrationTest` (Testcontainers Redis 7.4): bucketed TTL Sets, offset checkpoint gap tolerance, `PENDING` crash recovery & partial mismatch rejection, and atomic 1-RTT `rank_and_score.lua`.
-- `RewardTopologyTest`: dedupe, DLT routing, conflict quarantine, late-event sequential deterministic `deltaId`, and retention TTL expiry.
-- Unit tests covering `LeaderboardProjector` multi-partition grouping, `LeaderboardService` micro-cache, `InvoiceEventPublisher` backpressure, `DiscountService`, and `ApiExceptionHandler`.
+Expected: **49 automated tests** (`mvn test` / `mvn clean package`), 0 failures, 0 errors:
+- `GamificationEndToEndIntegrationTest` (Testcontainers real Kafka 4.4.0 + Redis 7.4 + full Spring Boot HTTP server): REST single/batch, competition ranking, discount tiers, duplicate replay, company conflict quarantine to DLT, poison-pill resilience, `kafkaStreams` Actuator health component, path-variable validation, and live Micrometer metrics.
+- `LeaderboardApplyServiceIntegrationTest` (Testcontainers Redis 7.4): multi-day bucketed TTL Sets, offset checkpoint gap tolerance, atomic `PENDING` crash recovery & partial mismatch rollback rejection, zero-points Lua guard, and atomic 1-RTT `rank_and_score.lua`.
+- `RewardTopologyTest`: dedupe, null/mismatched key & expired-timestamp DLT routing, conflict quarantine, multi-bucket Bloom + saturation fallback, and disk RocksDB restart restoration for dedupe & `nextEmitSeq`.
+- Unit tests covering `HighThroughputRocksDBConfig` (12-thread concurrent config & cleanup), `LeaderboardProjector` multi-partition grouping, `LeaderboardService` Top-100 slicing & cold-start single-flight cache, `InvoiceEventPublisher` partial-batch backpressure & permit safety, `DiscountService`, and `ApiExceptionHandler`.
 
 ### 11. Run the performance benchmark
 
@@ -444,8 +444,9 @@ A 100,000-event run is dominated by the fixed 500 ms window and projection drain
 | Bloom filter negative-cache accuracy (3.61M keys) | — | **3,609,996 skips / 4 false positives (99.9999%)** |
 | Redis write compression (3.61M events) | — | **64,037 deltas → 1,968 Lua batches (1,834:1)** |
 | RocksDB footprint (3.61M keys, LZ4) | — | **31 MB on disk** |
-| Graceful restart & state restore (3.61M keys) | — | **33.97 s** total (`REBALANCING → RUNNING`); replay & conflict added **0 pts**, fresh invoice awarded **10 pts** |
-| Automated JUnit + Testcontainers E2E | — | **36/36 passed** |
+| Graceful restart & state restore (3.61M keys) | — | **30.41 s** (`33.97 s` earlier) `REBALANCING → RUNNING`; replay & conflict added **0 pts**, fresh invoice awarded **10 pts** |
+| Under-load leaderboard p95 (post-hardening, Top-100 cache) | — | **3.54 – 8.32 ms p95** across 17.9k–24.0k concurrent reads (`0.29 – 1.06 ms` post-drain; `3,609,997 / 3,610,000` Bloom skips = **99.9999%**, `32 MB` RocksDB) |
+| Automated JUnit + Testcontainers E2E | — | **49/49 passed** (`-Xlint:unchecked` clean) |
 
 Across the three final 1M-event direct Kafka runs (concurrent with 8 HTTP leaderboard reader threads on the same Apple M4 host), end-to-end throughput measured `99,746.53`, `138,627.96`, and `98,800.41` events/s with pipeline backlog drain rates of `175k–201k` events/s, while a 500,000-event REST batch run measured `142,788.10` accepted events/s and `96,606.04` E2E events/s. Post-drain leaderboard p95 stayed at `0.27–1.05 ms` and under-load concurrent read p95 improved to `13.55–17.19 ms`.
 

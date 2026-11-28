@@ -17,18 +17,19 @@ import org.springframework.stereotype.Service;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Set;
-import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 @Service
 public class LeaderboardService {
 
+    private static final int CACHED_TOP_LIMIT = 100;
+
     private final StringRedisTemplate redisTemplate;
     private final DiscountService discountService;
     private final String leaderboardKey;
     private final long topCacheTtlNanos;
-    private final DefaultRedisScript<List> rankAndScoreScript;
-    private final ConcurrentHashMap<Integer, TopCacheSlot> topCache = new ConcurrentHashMap<>();
+    private final DefaultRedisScript<List<?>> rankAndScoreScript;
+    private final TopCacheSlot topSnapshot = new TopCacheSlot();
 
     public LeaderboardService(
             StringRedisTemplate redisTemplate,
@@ -39,6 +40,7 @@ public class LeaderboardService {
     }
 
     @Autowired
+    @SuppressWarnings({"unchecked", "rawtypes"})
     public LeaderboardService(
             StringRedisTemplate redisTemplate,
             DiscountService discountService,
@@ -51,33 +53,52 @@ public class LeaderboardService {
         this.topCacheTtlNanos = Math.max(0L, topCacheTtlMs) * 1_000_000L;
         this.rankAndScoreScript = new DefaultRedisScript<>();
         this.rankAndScoreScript.setLocation(new ClassPathResource("scripts/rank_and_score.lua"));
-        this.rankAndScoreScript.setResultType(List.class);
+        this.rankAndScoreScript.setResultType((Class<List<?>>) (Class) List.class);
     }
 
     public LeaderboardResponse top(int limit) {
-        if (topCacheTtlNanos <= 0L) {
+        if (topCacheTtlNanos <= 0L || limit > CACHED_TOP_LIMIT) {
             return loadTop(limit);
         }
 
-        TopCacheSlot slot = topCache.computeIfAbsent(limit, ignored -> new TopCacheSlot());
         long now = System.nanoTime();
-        CachedTop current = slot.snapshot;
+        CachedTop current = topSnapshot.snapshot;
         if (current != null && (now - current.loadedAtNanos()) < topCacheTtlNanos) {
-            return current.response();
+            return slice(current.response(), limit);
         }
 
-        // Single-flight stale-while-revalidate: one caller refreshes without holding any map lock,
-        // while concurrent readers immediately receive the cached snapshot instead of queuing on Redis.
-        if (slot.refreshing.compareAndSet(false, true)) {
-            try {
-                LeaderboardResponse fresh = loadTop(limit);
-                slot.snapshot = new CachedTop(fresh, System.nanoTime());
-                return fresh;
-            } finally {
-                slot.refreshing.set(false);
+        // Cold-start synchronization prevents a Redis stampede before the first snapshot exists.
+        if (current == null) {
+            synchronized (topSnapshot.initLock) {
+                current = topSnapshot.snapshot;
+                if (current == null) {
+                    LeaderboardResponse fresh = loadTop(CACHED_TOP_LIMIT);
+                    topSnapshot.snapshot = new CachedTop(fresh, System.nanoTime());
+                    return slice(fresh, limit);
+                }
+                return slice(current.response(), limit);
             }
         }
-        return current != null ? current.response() : loadTop(limit);
+
+        // Single-flight stale-while-revalidate: one caller refreshes while concurrent readers get the cached snapshot.
+        if (topSnapshot.refreshing.compareAndSet(false, true)) {
+            try {
+                LeaderboardResponse fresh = loadTop(CACHED_TOP_LIMIT);
+                topSnapshot.snapshot = new CachedTop(fresh, System.nanoTime());
+                return slice(fresh, limit);
+            } finally {
+                topSnapshot.refreshing.set(false);
+            }
+        }
+        return slice(current.response(), limit);
+    }
+
+    private LeaderboardResponse slice(LeaderboardResponse fullTop, int limit) {
+        List<LeaderboardEntry> all = fullTop.entries();
+        if (all.size() <= limit) {
+            return fullTop.limit() == limit ? fullTop : new LeaderboardResponse(limit, all);
+        }
+        return new LeaderboardResponse(limit, all.subList(0, limit));
     }
 
     private LeaderboardResponse loadTop(int limit) {
@@ -91,13 +112,15 @@ public class LeaderboardService {
         List<LeaderboardEntry> entries = new ArrayList<>(tuples.size());
         long position = 0;
         long rank = 0;
-        Double previousScore = null;
+        double previousScore = 0.0;
+        boolean hasPrevious = false;
         for (ZSetOperations.TypedTuple<String> tuple : tuples) {
             position++;
             Double rawScore = tuple.getScore();
             double score = rawScore != null ? rawScore : 0.0;
-            if (previousScore == null || score != previousScore) {
+            if (!hasPrevious || score != previousScore) {
                 rank = position;
+                hasPrevious = true;
             }
             entries.add(new LeaderboardEntry(rank, tuple.getValue(), (long) score));
             previousScore = score;
@@ -133,9 +156,8 @@ public class LeaderboardService {
         );
     }
 
-    @SuppressWarnings("unchecked")
     private ScoreAndRank fetchScoreAndRank(String companyId) {
-        List<Object> raw = redisTemplate.execute(rankAndScoreScript, List.of(leaderboardKey), companyId);
+        List<?> raw = redisTemplate.execute(rankAndScoreScript, List.of(leaderboardKey), companyId);
         if (raw == null || raw.size() < 2) {
             return null;
         }
@@ -153,5 +175,6 @@ public class LeaderboardService {
     private static final class TopCacheSlot {
         volatile CachedTop snapshot;
         final AtomicBoolean refreshing = new AtomicBoolean(false);
+        final Object initLock = new Object();
     }
 }

@@ -11,7 +11,6 @@ import org.apache.kafka.streams.processor.api.Record;
 import org.apache.kafka.streams.state.KeyValueIterator;
 import org.apache.kafka.streams.state.KeyValueStore;
 
-import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.time.Instant;
@@ -25,9 +24,9 @@ import java.util.TreeMap;
 /**
  * Aggregates deduplicated invoice points per company over fixed event-time windows.
  *
- * <p>Maintains an in-memory window index synchronized with the transactional RocksDB store so
- * {@code process()} avoids RocksDB reads and {@code flush()} inspects only expired windows in O(ready)
- * instead of scanning the full store. Emits deterministic, sequence-numbered delta IDs so EOS rollbacks
+ * <p>Maintains an in-memory window index synchronized with a caching-enabled RocksDB store so
+ * {@code process()} avoids RocksDB reads and byte-key re-encoding, while {@code flush()} inspects
+ * only expired windows in O(ready). Emits deterministic sequence-numbered delta IDs so EOS rollbacks
  * reproduce identical IDs while late arrivals receive distinct sequence numbers.
  */
 public class WindowAggregatorProcessor implements Processor<String, InvoiceIssuedEvent, String, CompanyRewardDelta> {
@@ -49,7 +48,7 @@ public class WindowAggregatorProcessor implements Processor<String, InvoiceIssue
     private KeyValueStore<byte[], byte[]> store;
     private int taskPartition;
     private long nextEmitSeq;
-    private final NavigableMap<Long, Map<String, Long>> activeWindows = new TreeMap<>();
+    private final NavigableMap<Long, Map<String, WindowAccum>> activeWindows = new TreeMap<>();
 
     public WindowAggregatorProcessor(long windowMs, long punctuationMs, RewardMetrics metrics) {
         this.windowMs = Math.max(10L, windowMs);
@@ -72,13 +71,13 @@ public class WindowAggregatorProcessor implements Processor<String, InvoiceIssue
                     continue;
                 }
                 if (entry.key[0] == SEQ_PREFIX) {
-                    this.nextEmitSeq = bytesToLong(entry.value);
+                    this.nextEmitSeq = decodeLong(entry.value, 0);
                 } else if (entry.key[0] == WINDOW_PREFIX && entry.key.length > 1 + Long.BYTES) {
-                    long windowStart = decodeWindowStart(entry.key);
+                    long windowStart = decodeLong(entry.key, 1);
                     String companyId = decodeCompanyId(entry.key);
-                    long points = bytesToLong(entry.value);
+                    long points = decodeLong(entry.value, 0);
                     activeWindows.computeIfAbsent(windowStart, ignored -> new HashMap<>())
-                            .put(companyId, points);
+                            .put(companyId, new WindowAccum(points, entry.key));
                 }
             }
         }
@@ -97,10 +96,15 @@ public class WindowAggregatorProcessor implements Processor<String, InvoiceIssue
         }
         String companyId = record.key();
         long windowStart = Math.floorDiv(record.timestamp(), windowMs) * windowMs;
-        long updatedPoints = activeWindows
-                .computeIfAbsent(windowStart, ignored -> new HashMap<>())
-                .merge(companyId, POINTS_PER_INVOICE, Long::sum);
-        store.put(encodeWindowKey(windowStart, companyId), longToBytes(updatedPoints));
+        Map<String, WindowAccum> companyMap = activeWindows.computeIfAbsent(windowStart, ignored -> new HashMap<>());
+        WindowAccum accum = companyMap.get(companyId);
+        if (accum == null) {
+            accum = new WindowAccum(POINTS_PER_INVOICE, encodeWindowKey(windowStart, companyId));
+            companyMap.put(companyId, accum);
+        } else {
+            accum.points += POINTS_PER_INVOICE;
+        }
+        store.put(accum.storeKey, encodeLong(accum.points));
     }
 
     private void flush(long now) {
@@ -109,65 +113,84 @@ public class WindowAggregatorProcessor implements Processor<String, InvoiceIssue
         }
         long maxReadyStart = now - windowMs;
         boolean emittedAny = false;
-        Iterator<Map.Entry<Long, Map<String, Long>>> windowIterator =
+        Iterator<Map.Entry<Long, Map<String, WindowAccum>>> windowIterator =
                 activeWindows.headMap(maxReadyStart, true).entrySet().iterator();
 
         while (windowIterator.hasNext()) {
-            Map.Entry<Long, Map<String, Long>> windowEntry = windowIterator.next();
+            Map.Entry<Long, Map<String, WindowAccum>> windowEntry = windowIterator.next();
             long windowStart = windowEntry.getKey();
             long windowEnd = windowStart + windowMs;
             Instant startInstant = Instant.ofEpochMilli(windowStart);
             Instant endInstant = Instant.ofEpochMilli(windowEnd);
 
-            for (Map.Entry<String, Long> companyEntry : windowEntry.getValue().entrySet()) {
+            for (Map.Entry<String, WindowAccum> companyEntry : windowEntry.getValue().entrySet()) {
                 String companyId = companyEntry.getKey();
-                long points = companyEntry.getValue();
+                WindowAccum accum = companyEntry.getValue();
                 long seq = nextEmitSeq++;
                 String deltaId = taskPartition + ":" + windowStart + ":" + companyId + ":" + seq;
 
                 CompanyRewardDelta delta = new CompanyRewardDelta(
                         deltaId,
                         companyId,
-                        points,
+                        accum.points,
                         startInstant,
                         endInstant,
                         CompanyRewardDelta.SCHEMA_VERSION
                 );
-                store.delete(encodeWindowKey(windowStart, companyId));
+                store.delete(accum.storeKey);
                 context.forward(new Record<>(companyId, delta, windowEnd));
-                metrics.recordWindowEmitted(points);
+                metrics.recordWindowEmitted(accum.points);
                 emittedAny = true;
             }
             windowIterator.remove();
         }
 
         if (emittedAny) {
-            store.put(SEQ_KEY, longToBytes(nextEmitSeq));
+            store.put(SEQ_KEY, encodeLong(nextEmitSeq));
         }
     }
 
     private static byte[] encodeWindowKey(long windowStart, String companyId) {
         byte[] companyBytes = companyId.getBytes(StandardCharsets.UTF_8);
-        ByteBuffer buffer = ByteBuffer.allocate(1 + Long.BYTES + companyBytes.length);
-        buffer.put(WINDOW_PREFIX);
-        buffer.putLong(windowStart);
-        buffer.put(companyBytes);
-        return buffer.array();
-    }
-
-    private static long decodeWindowStart(byte[] key) {
-        return ByteBuffer.wrap(key, 1, Long.BYTES).getLong();
+        byte[] out = new byte[1 + Long.BYTES + companyBytes.length];
+        out[0] = WINDOW_PREFIX;
+        writeLong(out, 1, windowStart);
+        System.arraycopy(companyBytes, 0, out, 1 + Long.BYTES, companyBytes.length);
+        return out;
     }
 
     private static String decodeCompanyId(byte[] key) {
         return new String(key, 1 + Long.BYTES, key.length - 1 - Long.BYTES, StandardCharsets.UTF_8);
     }
 
-    private static byte[] longToBytes(long value) {
-        return ByteBuffer.allocate(Long.BYTES).putLong(value).array();
+    private static byte[] encodeLong(long value) {
+        byte[] out = new byte[Long.BYTES];
+        writeLong(out, 0, value);
+        return out;
     }
 
-    private static long bytesToLong(byte[] bytes) {
-        return ByteBuffer.wrap(bytes).getLong();
+    private static void writeLong(byte[] dst, int offset, long value) {
+        for (int i = Long.BYTES - 1; i >= 0; i--) {
+            dst[offset + i] = (byte) (value & 0xFFL);
+            value >>>= 8;
+        }
+    }
+
+    private static long decodeLong(byte[] src, int offset) {
+        long value = 0L;
+        for (int i = 0; i < Long.BYTES; i++) {
+            value = (value << 8) | (src[offset + i] & 0xFFL);
+        }
+        return value;
+    }
+
+    private static final class WindowAccum {
+        long points;
+        final byte[] storeKey;
+
+        WindowAccum(long points, byte[] storeKey) {
+            this.points = points;
+            this.storeKey = storeKey;
+        }
     }
 }

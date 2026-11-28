@@ -32,42 +32,54 @@ public class LeaderboardProjector {
 
         ConsumerRecord<String, CompanyRewardDelta> firstValid = null;
         boolean singlePartition = true;
-        List<ConsumerRecord<String, CompanyRewardDelta>> validRecords = new ArrayList<>(records.size());
+        boolean allValid = true;
 
         for (ConsumerRecord<String, CompanyRewardDelta> record : records) {
-            CompanyRewardDelta delta = record.value();
-            if (valid(delta)) {
-                if (firstValid == null) {
-                    firstValid = record;
-                } else if (singlePartition
-                        && (record.partition() != firstValid.partition()
-                        || !record.topic().equals(firstValid.topic()))) {
-                    singlePartition = false;
-                }
-                validRecords.add(record);
-            } else {
+            if (!valid(record.value())) {
+                allValid = false;
                 log.warn(
                         "Skipping invalid company reward delta at topic={} partition={} offset={}",
                         record.topic(),
                         record.partition(),
                         record.offset()
                 );
+                continue;
+            }
+            if (firstValid == null) {
+                firstValid = record;
+            } else if (singlePartition
+                    && (record.partition() != firstValid.partition()
+                    || !record.topic().equals(firstValid.topic()))) {
+                singlePartition = false;
             }
         }
 
-        if (validRecords.isEmpty()) {
+        if (firstValid == null) {
             return;
         }
 
         if (singlePartition) {
             String markerId = firstValid.topic() + ":" + firstValid.partition();
-            applyService.applyPartitionBatch(validRecords, markerId);
+            if (allValid) {
+                applyService.applyPartitionBatch(records, markerId);
+                return;
+            }
+            List<ConsumerRecord<String, CompanyRewardDelta>> filtered = new ArrayList<>(records.size());
+            for (ConsumerRecord<String, CompanyRewardDelta> record : records) {
+                if (valid(record.value())) {
+                    filtered.add(record);
+                }
+            }
+            applyService.applyPartitionBatch(filtered, markerId);
             return;
         }
 
         // Preserve strict single-partition ordering and marker isolation when a poll spans multiple partitions.
         Map<TopicPartition, List<ConsumerRecord<String, CompanyRewardDelta>>> byPartition = new LinkedHashMap<>();
-        for (ConsumerRecord<String, CompanyRewardDelta> record : validRecords) {
+        for (ConsumerRecord<String, CompanyRewardDelta> record : records) {
+            if (!valid(record.value())) {
+                continue;
+            }
             byPartition.computeIfAbsent(
                     new TopicPartition(record.topic(), record.partition()),
                     ignored -> new ArrayList<>()

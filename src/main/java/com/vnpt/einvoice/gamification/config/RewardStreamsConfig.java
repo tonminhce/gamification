@@ -2,7 +2,6 @@ package com.vnpt.einvoice.gamification.config;
 
 import com.vnpt.einvoice.gamification.metrics.RewardMetrics;
 import com.vnpt.einvoice.gamification.streams.RewardTopology;
-import jakarta.annotation.PreDestroy;
 import org.apache.kafka.clients.consumer.ConsumerConfig;
 import org.apache.kafka.clients.producer.ProducerConfig;
 import org.apache.kafka.common.serialization.Serdes;
@@ -10,11 +9,14 @@ import org.apache.kafka.streams.KafkaStreams;
 import org.apache.kafka.streams.StreamsConfig;
 import org.apache.kafka.streams.Topology;
 import org.apache.kafka.streams.errors.LogAndContinueExceptionHandler;
+import org.apache.kafka.streams.errors.StreamsUncaughtExceptionHandler;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
-import org.springframework.boot.ApplicationRunner;
+import org.springframework.boot.health.contributor.Health;
+import org.springframework.boot.health.contributor.HealthIndicator;
 import org.springframework.boot.kafka.autoconfigure.KafkaConnectionDetails;
+import org.springframework.context.SmartLifecycle;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 
@@ -26,8 +28,6 @@ import java.util.Properties;
 public class RewardStreamsConfig {
 
     private static final Logger log = LoggerFactory.getLogger(RewardStreamsConfig.class);
-
-    private KafkaStreams managedStreams;
 
     @Bean
     Topology rewardTopology(
@@ -52,7 +52,7 @@ public class RewardStreamsConfig {
         );
     }
 
-    @Bean
+    @Bean(destroyMethod = "")
     KafkaStreams rewardStreams(
             Topology rewardTopology,
             KafkaConnectionDetails connectionDetails,
@@ -60,8 +60,9 @@ public class RewardStreamsConfig {
             @Value("${app.streams.threads}") int threads,
             @Value("${app.streams.commit-interval-ms}") long commitIntervalMs,
             @Value("${app.streams.state-dir}") String stateDir,
+            @Value("${app.kafka.replication-factor:1}") int replicationFactor,
             @Value("${app.streams.rocksdb-block-cache-mb:256}") long blockCacheMb,
-            @Value("${app.streams.rocksdb-write-buffer-mb:128}") long writeBufferMb
+            @Value("${app.streams.rocksdb-write-buffer-mb:16}") long writeBufferMb
     ) {
         List<String> servers = connectionDetails.getStreams().getBootstrapServers();
         if (servers == null || servers.isEmpty()) {
@@ -74,7 +75,7 @@ public class RewardStreamsConfig {
         properties.put(StreamsConfig.BOOTSTRAP_SERVERS_CONFIG, bootstrapServers);
         properties.put(StreamsConfig.PROCESSING_GUARANTEE_CONFIG, StreamsConfig.EXACTLY_ONCE_V2);
         properties.put(StreamsConfig.COMMIT_INTERVAL_MS_CONFIG, commitIntervalMs);
-        properties.put(StreamsConfig.REPLICATION_FACTOR_CONFIG, 1);
+        properties.put(StreamsConfig.REPLICATION_FACTOR_CONFIG, replicationFactor);
         properties.put(StreamsConfig.NUM_STREAM_THREADS_CONFIG, threads);
         properties.put(StreamsConfig.STATE_DIR_CONFIG, stateDir);
         properties.put(StreamsConfig.DEFAULT_KEY_SERDE_CLASS_CONFIG, Serdes.StringSerde.class);
@@ -86,7 +87,6 @@ public class RewardStreamsConfig {
                 StreamsConfig.DESERIALIZATION_EXCEPTION_HANDLER_CLASS_CONFIG,
                 LogAndContinueExceptionHandler.class
         );
-        properties.put("processing.exception.handler.global.enabled", true);
         properties.put(
                 StreamsConfig.consumerPrefix(ConsumerConfig.AUTO_OFFSET_RESET_CONFIG),
                 "earliest"
@@ -98,22 +98,42 @@ public class RewardStreamsConfig {
         KafkaStreams streams = new KafkaStreams(rewardTopology, properties);
         streams.setUncaughtExceptionHandler(exception -> {
             log.error("Uncaught exception in Kafka Streams thread, shutting down client", exception);
-            return org.apache.kafka.streams.errors.StreamsUncaughtExceptionHandler.StreamThreadExceptionResponse.SHUTDOWN_CLIENT;
+            return StreamsUncaughtExceptionHandler.StreamThreadExceptionResponse.SHUTDOWN_CLIENT;
         });
-        this.managedStreams = streams;
         return streams;
     }
 
-    @PreDestroy
-    void closeStreams() {
-        if (managedStreams != null) {
-            managedStreams.close(Duration.ofSeconds(10));
-        }
+    @Bean
+    SmartLifecycle rewardStreamsLifecycle(KafkaStreams rewardStreams) {
+        return new SmartLifecycle() {
+            private volatile boolean running;
+
+            @Override
+            public void start() {
+                // Start after topic beans and KafkaAdmin refresh so fresh brokers never hit MissingSourceTopicException.
+                rewardStreams.start();
+                running = true;
+            }
+
+            @Override
+            public void stop() {
+                running = false;
+                rewardStreams.close(Duration.ofSeconds(10));
+            }
+
+            @Override
+            public boolean isRunning() {
+                return running && rewardStreams.state().isRunningOrRebalancing();
+            }
+        };
     }
 
     @Bean
-    ApplicationRunner startRewardStreams(KafkaStreams rewardStreams) {
-        // Topic beans are created during context refresh; starting here prevents MissingSourceTopicException on fresh brokers.
-        return args -> rewardStreams.start();
+    HealthIndicator kafkaStreamsHealthIndicator(KafkaStreams rewardStreams) {
+        return () -> {
+            KafkaStreams.State state = rewardStreams.state();
+            Health.Builder builder = state.isRunningOrRebalancing() ? Health.up() : Health.down();
+            return builder.withDetail("state", state.name()).build();
+        };
     }
 }

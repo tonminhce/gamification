@@ -69,13 +69,14 @@ app:
     delta-topic: company-reward-deltas
     dlt-topic: invoice-events.DLT
     partitions: 12
+    replication-factor: 1
   streams:
     application-id: einvoice-reward-streams
     threads: 6
     commit-interval-ms: 500
     state-dir: ${STREAMS_STATE_DIR:./data/einvoice-reward-streams}
     rocksdb-block-cache-mb: 256
-    rocksdb-write-buffer-mb: 128
+    rocksdb-write-buffer-mb: 16
   dedupe:
     retention-ms: 86400000
     bloom-expected-insertions: 4000000

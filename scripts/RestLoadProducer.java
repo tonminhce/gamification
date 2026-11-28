@@ -22,6 +22,9 @@ public class RestLoadProducer {
         int companies = args.length > 2 ? Integer.parseInt(args[2]) : 20;
         String api = args.length > 3 ? args[3] : "http://localhost:8080";
         int batchSize = args.length > 4 ? Integer.parseInt(args[4]) : 1;
+        if (companies < 1 || companies > 100) {
+            throw new IllegalArgumentException("companies must be between 1 and 100");
+        }
         String runId = "REST-" + System.currentTimeMillis();
 
         JsonMapper mapper = JsonMapper.builder().build();

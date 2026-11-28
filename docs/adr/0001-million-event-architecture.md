@@ -16,12 +16,12 @@ Kiến trúc “mỗi invoice → một Lua script → một Redis marker” ch�
 Đã hoàn thiện trong POC:
 
 - Hai hop `invoice-events → company-reward-deltas → Redis`, Streams `exactly_once_v2`, broker Kafka 4.4.0.
-- Dedupe `invoiceId` trong bounded-retention RocksDB `WindowStore` (`24h` mặc định) + changelog, 2-generation rotating primitive Bloom cache, phát hiện conflict cùng `invoiceId` khác `companyId` và quarantine sang `invoice-events.DLT`.
-- `HighThroughputRocksDBConfig`: shared 256 MB `LRUCache`, 16 KB blocks, native SST Bloom filter, nén `LZ4` (`31 MB` cho 3,61M keys).
+- Dedupe `invoiceId` trong bounded-retention RocksDB `WindowStore` (`24h` mặc định) + changelog, 3-bucket `TimeBucketedBloomFilter` (saturation fallback), phát hiện expired timestamp & conflict cùng `invoiceId` khác `companyId` và quarantine sang `invoice-events.DLT`.
+- `HighThroughputRocksDBConfig`: shared 256 MB `LRUCache`, 16 MB write buffer, 16 KB blocks, per-instance native SST Bloom filter, nén `LZ4` (`31–32 MB` cho 3,61M keys).
 - Window aggregation 500 ms với `TreeMap` index O(ready), `deltaId` deterministic dạng `partition:windowStart:companyId:seq`.
-- Projector `isolation.level=read_committed`, multi-partition grouping, per-partition offset checkpoint, daily-bucketed TTL delta Sets và `PENDING` recovery marker.
-- Read path 1-RTT `rank_and_score.lua` + 50 ms single-flight `top()` micro-cache; REST ingress dùng Java 25 Virtual Threads, `Semaphore` backpressure (`503 Retry-After: 1`) và Micrometer/Actuator metrics.
-- 36 test pass (bao gồm `GamificationEndToEndIntegrationTest` chạy trên Testcontainers Kafka 4.4.0 + Redis 7.4). Ba run 1M direct Kafka đạt **99.746,53 / 138.627,96 / 98.800,41 events/s** end-to-end (drain **175k–201k/s**), post-drain p95 **0,27–0,62 ms**, under-load p95 **13,55–17,19 ms**; 500k REST batch đạt **142.788,10 accepted/s** (**96.606,04 E2E/s**, p95 **1,05 ms**); restore 3,61M keys sau restart hoàn tất trong **33,97 s** với 0 điểm trùng.
+- Projector `isolation.level=read_committed`, multi-partition grouping, per-partition offset checkpoint, daily-bucketed TTL delta Sets và `PENDING` recovery marker có kiểm tra pre-update scores trước khi ghi.
+- Read path 1-RTT `rank_and_score.lua` + 50 ms single-flight Top-100 micro-cache (`initLock`); REST ingress dùng Java 25 Virtual Threads, `Semaphore` backpressure (`503 Retry-After: 1`), và Actuator `kafkaStreams` health + Micrometer metrics.
+- 49 test pass (bao gồm `GamificationEndToEndIntegrationTest` chạy trên Testcontainers Kafka 4.4.0 + Redis 7.4). Ba run 1M direct Kafka đạt **99.746,53 / 138.627,96 / 98.800,41 events/s** end-to-end (drain **175k–201k/s**), post-drain p95 **0,27–0,62 ms**, under-load p95 **13,55–17,19 ms**; 500k REST batch đạt **142.788,10 accepted/s** (**96.606,04 E2E/s**, p95 **1,05 ms**); bản hardened sau code review (`49/49` tests) hạ under-load Top-100 p95 xuống **3,54–8,32 ms** trên 17,9k–24,0k reads (Bloom skip **99.9999%**, drain **156,0k/s** dù share Docker VM với stack khác) và restore 3,61M keys sau restart trong **30,41 s** với 0 điểm trùng.
 
 Còn mở cho Stage 3 (cluster production):
 

@@ -7,8 +7,6 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.core.io.ClassPathResource;
 import org.springframework.dao.DataAccessException;
-import org.springframework.data.redis.RedisSystemException;
-import org.springframework.data.redis.connection.DataType;
 import org.springframework.data.redis.connection.ReturnType;
 import org.springframework.data.redis.core.RedisCallback;
 import org.springframework.data.redis.core.StringRedisTemplate;
@@ -22,9 +20,6 @@ import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.Set;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
  * Applies idempotent company reward delta batches to Redis using a single atomic Lua script
@@ -38,16 +33,14 @@ public class LeaderboardApplyService {
     private static final String MARKER_PREFIX = "einv:delta-batch:";
     private static final String CHECKPOINT_PREFIX = "einv:projector-checkpoint:";
     private static final long SECONDS_PER_DAY = 86_400L;
+    private static final byte[][] CACHED_BUCKET_INDICES = buildBucketIndexCache(8);
 
     private final StringRedisTemplate redisTemplate;
     private final byte[] script;
-    private final String leaderboardKeyName;
     private final byte[] leaderboardKey;
     private final byte[] markerTtl;
     private final String processedDeltaPrefix;
     private final RewardMetrics metrics;
-    private final AtomicBoolean leaderboardTypeValidated = new AtomicBoolean(false);
-    private final Set<String> validatedBucketKeys = ConcurrentHashMap.newKeySet();
     private volatile String scriptSha;
 
     public LeaderboardApplyService(
@@ -68,7 +61,6 @@ public class LeaderboardApplyService {
             RewardMetrics metrics
     ) {
         this.redisTemplate = redisTemplate;
-        this.leaderboardKeyName = leaderboardKey;
         this.leaderboardKey = SERIALIZER.serialize(leaderboardKey);
         this.markerTtl = SERIALIZER.serialize(Long.toString(markerTtlSeconds));
         this.processedDeltaPrefix = processedDeltaSet;
@@ -84,11 +76,7 @@ public class LeaderboardApplyService {
         if (deltas.isEmpty()) {
             return 0;
         }
-        List<DeltaEntry> entries = new ArrayList<>(deltas.size());
-        for (CompanyRewardDelta delta : deltas) {
-            entries.add(new DeltaEntry(-1L, delta));
-        }
-        return applyEntries(entries, markerId, -1L);
+        return applyInternal(deltas.size(), deltas, null, markerId, -1L);
     }
 
     public int applyPartitionBatch(
@@ -98,86 +86,131 @@ public class LeaderboardApplyService {
         if (records.isEmpty()) {
             return 0;
         }
-        List<DeltaEntry> entries = new ArrayList<>(records.size());
         long maxOffset = -1L;
         for (ConsumerRecord<String, CompanyRewardDelta> record : records) {
             if (record.offset() > maxOffset) {
                 maxOffset = record.offset();
             }
-            CompanyRewardDelta delta = record.value();
-            if (delta != null) {
-                entries.add(new DeltaEntry(record.offset(), delta));
-            }
         }
-        if (entries.isEmpty()) {
-            return 0;
-        }
-        return applyEntries(entries, markerId, maxOffset);
+        return applyInternal(records.size(), null, records, markerId, maxOffset);
     }
 
-    private int applyEntries(List<DeltaEntry> entries, String markerId, long batchMaxOffset) {
+    private int applyInternal(
+            int count,
+            List<CompanyRewardDelta> directDeltas,
+            List<ConsumerRecord<String, CompanyRewardDelta>> records,
+            String markerId,
+            long batchMaxOffset
+    ) {
         long startNanos = System.nanoTime();
-        validateLeaderboardTypeOnce();
-
-        Map<Long, Integer> bucketIndexByDay = new LinkedHashMap<>();
-        List<String> bucketKeys = new ArrayList<>(2);
         long fallbackDay = Instant.now().getEpochSecond() / SECONDS_PER_DAY;
 
-        for (DeltaEntry entry : entries) {
-            Instant windowStart = entry.delta().windowStart();
-            long epochDay = windowStart != null ? windowStart.getEpochSecond() / SECONDS_PER_DAY : fallbackDay;
-            bucketIndexByDay.computeIfAbsent(epochDay, day -> {
-                String bucketKey = processedDeltaPrefix + ":" + day;
-                validateBucketTypeOnce(bucketKey);
-                bucketKeys.add(bucketKey);
-                return bucketKeys.size();
-            });
-        }
+        Map<Long, Integer> bucketIndexByDay = new LinkedHashMap<>(2);
+        List<byte[]> bucketKeys = new ArrayList<>(2);
+        int[] bucketIndices = new int[count];
+        int validCount = 0;
 
-        int bucketCount = bucketKeys.size();
-        int fixedKeyCount = 3 + bucketCount;
-        int argCount = 3 + entries.size() * 5;
-        byte[][] keysAndArguments = new byte[fixedKeyCount + argCount][];
-
-        int pos = 0;
-        keysAndArguments[pos++] = leaderboardKey;
-        keysAndArguments[pos++] = SERIALIZER.serialize(MARKER_PREFIX + markerId);
-        keysAndArguments[pos++] = SERIALIZER.serialize(CHECKPOINT_PREFIX + markerId);
-        for (String bucketKey : bucketKeys) {
-            keysAndArguments[pos++] = SERIALIZER.serialize(bucketKey);
-        }
-
-        keysAndArguments[pos++] = markerTtl;
-        keysAndArguments[pos++] = SERIALIZER.serialize(Integer.toString(bucketCount));
-        keysAndArguments[pos++] = SERIALIZER.serialize(Long.toString(batchMaxOffset));
-
-        for (DeltaEntry entry : entries) {
-            CompanyRewardDelta delta = entry.delta();
+        for (int i = 0; i < count; i++) {
+            CompanyRewardDelta delta = directDeltas != null ? directDeltas.get(i) : records.get(i).value();
+            if (delta == null) {
+                continue;
+            }
             Instant windowStart = delta.windowStart();
             long epochDay = windowStart != null ? windowStart.getEpochSecond() / SECONDS_PER_DAY : fallbackDay;
-            int bucketIdx = bucketIndexByDay.get(epochDay);
-
-            keysAndArguments[pos++] = SERIALIZER.serialize(Long.toString(entry.offset()));
-            keysAndArguments[pos++] = SERIALIZER.serialize(delta.deltaId());
-            keysAndArguments[pos++] = SERIALIZER.serialize(delta.companyId());
-            keysAndArguments[pos++] = SERIALIZER.serialize(Long.toString(delta.deltaPoints()));
-            keysAndArguments[pos++] = SERIALIZER.serialize(Integer.toString(bucketIdx));
+            Integer existingIdx = bucketIndexByDay.get(epochDay);
+            int bucketIdx;
+            if (existingIdx != null) {
+                bucketIdx = existingIdx;
+            } else {
+                bucketKeys.add(SERIALIZER.serialize(processedDeltaPrefix + ":" + epochDay));
+                bucketIdx = bucketKeys.size();
+                bucketIndexByDay.put(epochDay, bucketIdx);
+            }
+            bucketIndices[validCount++] = bucketIdx;
         }
 
-        int applied;
+        if (validCount == 0) {
+            return 0;
+        }
+
+        int fixedKeyCount = 3 + bucketKeys.size();
+        byte[][] keysAndArgs = buildKeysAndArgs(
+                fixedKeyCount,
+                bucketKeys,
+                markerId,
+                batchMaxOffset,
+                directDeltas,
+                records,
+                bucketIndices,
+                validCount
+        );
+
+        int applied = executeWithNoscriptRetry(fixedKeyCount, keysAndArgs);
+        metrics.recordProjectorBatch(validCount, applied, System.nanoTime() - startNanos);
+        return applied;
+    }
+
+    private byte[][] buildKeysAndArgs(
+            int fixedKeyCount,
+            List<byte[]> bucketKeys,
+            String markerId,
+            long batchMaxOffset,
+            List<CompanyRewardDelta> directDeltas,
+            List<ConsumerRecord<String, CompanyRewardDelta>> records,
+            int[] bucketIndices,
+            int validCount
+    ) {
+        int argCount = 3 + validCount * 5;
+        byte[][] keysAndArgs = new byte[fixedKeyCount + argCount][];
+
+        int pos = 0;
+        keysAndArgs[pos++] = leaderboardKey;
+        keysAndArgs[pos++] = SERIALIZER.serialize(MARKER_PREFIX + markerId);
+        keysAndArgs[pos++] = SERIALIZER.serialize(CHECKPOINT_PREFIX + markerId);
+        for (byte[] bucketKey : bucketKeys) {
+            keysAndArgs[pos++] = bucketKey;
+        }
+
+        keysAndArgs[pos++] = markerTtl;
+        keysAndArgs[pos++] = bucketIndexBytes(bucketKeys.size());
+        keysAndArgs[pos++] = SERIALIZER.serialize(Long.toString(batchMaxOffset));
+
+        int idxPos = 0;
+        int total = directDeltas != null ? directDeltas.size() : records.size();
+        for (int i = 0; i < total; i++) {
+            long offset;
+            CompanyRewardDelta delta;
+            if (directDeltas != null) {
+                offset = -1L;
+                delta = directDeltas.get(i);
+            } else {
+                ConsumerRecord<String, CompanyRewardDelta> record = records.get(i);
+                offset = record.offset();
+                delta = record.value();
+            }
+            if (delta == null) {
+                continue;
+            }
+            keysAndArgs[pos++] = SERIALIZER.serialize(Long.toString(offset));
+            keysAndArgs[pos++] = SERIALIZER.serialize(delta.deltaId());
+            keysAndArgs[pos++] = SERIALIZER.serialize(delta.companyId());
+            keysAndArgs[pos++] = SERIALIZER.serialize(Long.toString(delta.deltaPoints()));
+            keysAndArgs[pos++] = bucketIndexBytes(bucketIndices[idxPos++]);
+        }
+        return keysAndArgs;
+    }
+
+    private int executeWithNoscriptRetry(int keyCount, byte[][] keysAndArgs) {
         try {
-            applied = execute(fixedKeyCount, keysAndArguments, scriptSha());
+            return execute(keyCount, keysAndArgs, scriptSha());
         } catch (DataAccessException ex) {
             Throwable cause = ex.getMostSpecificCause();
             if (cause.getMessage() == null || !cause.getMessage().contains("NOSCRIPT")) {
                 throw ex;
             }
             scriptSha = null;
-            applied = execute(fixedKeyCount, keysAndArguments, scriptSha());
+            return execute(keyCount, keysAndArgs, scriptSha());
         }
-
-        metrics.recordProjectorBatch(entries.size(), applied, System.nanoTime() - startNanos);
-        return applied;
     }
 
     private int execute(int keyCount, byte[][] keysAndArguments, String sha) {
@@ -192,28 +225,6 @@ public class LeaderboardApplyService {
             throw new IllegalStateException("Leaderboard delta script returned no result");
         }
         return applied.intValue();
-    }
-
-    private void validateLeaderboardTypeOnce() {
-        if (leaderboardTypeValidated.get()) {
-            return;
-        }
-        DataType leaderboardType = redisTemplate.type(leaderboardKeyName);
-        if (leaderboardType != DataType.NONE && leaderboardType != DataType.ZSET) {
-            throw new RedisSystemException("leaderboard key has unexpected type: " + leaderboardType, null);
-        }
-        leaderboardTypeValidated.set(true);
-    }
-
-    private void validateBucketTypeOnce(String bucketKey) {
-        if (validatedBucketKeys.contains(bucketKey)) {
-            return;
-        }
-        DataType processedType = redisTemplate.type(bucketKey);
-        if (processedType != DataType.NONE && processedType != DataType.SET) {
-            throw new RedisSystemException("processed delta set has unexpected type: " + processedType, null);
-        }
-        validatedBucketKeys.add(bucketKey);
     }
 
     private String scriptSha() {
@@ -235,6 +246,18 @@ public class LeaderboardApplyService {
         return sha;
     }
 
-    private record DeltaEntry(long offset, CompanyRewardDelta delta) {
+    private static byte[] bucketIndexBytes(int index) {
+        if (index >= 1 && index < CACHED_BUCKET_INDICES.length) {
+            return CACHED_BUCKET_INDICES[index];
+        }
+        return SERIALIZER.serialize(Integer.toString(index));
+    }
+
+    private static byte[][] buildBucketIndexCache(int maxCached) {
+        byte[][] cache = new byte[maxCached + 1][];
+        for (int i = 1; i <= maxCached; i++) {
+            cache[i] = SERIALIZER.serialize(Integer.toString(i));
+        }
+        return cache;
     }
 }

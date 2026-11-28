@@ -143,7 +143,7 @@ Use these formulas on the whiteboard when your Tech Lead asks *"How do we take t
 Run every command from the repo root. (If ports `8080/9092/6379` are free on your machine, omit the `19092/16379/18080` overrides.)
 
 ### Step 1: Show Automated Proof First (2 minutes)
-Point out that we don't just test with mocks—we run **36 automated tests** including **real Kafka 4.4.0 + Redis 7.4 via Testcontainers**:
+Point out that we don't just test with mocks—we run **49 automated tests** including **real Kafka 4.4.0 + Redis 7.4 via Testcontainers**:
 ```bash
 export JAVA_HOME=$(/usr/libexec/java_home -v 25)
 mvn test
@@ -231,7 +231,7 @@ Point out on screen:
 2. **"Why did you put `invoiceId` as the input Kafka key instead of `companyId`?"**
    - *Answer:* "Two reasons: avoiding hot-company partition skew on ingress, and guaranteeing that any retry of `INV-1001` lands on the same Kafka Streams task and local RocksDB store. We then pre-aggregate per window per task and emit deltas keyed by `companyId` onto `company-reward-deltas`—giving us map-side combining without paying the 2x Kafka I/O cost of repartitioning every raw invoice."
 3. **"What happens if the Bloom filter has a false positive?"**
-   - *Answer:* "Nothing bad—it's strictly a negative cache! On a Bloom miss, we know 100% the key isn't in RocksDB and skip the disk read. On a Bloom hit, we **always verify in RocksDB `WindowStore`**, so a false positive costs one local lookup and never drops a valid invoice. Plus we rotate a 2-generation Bloom filter so false positives stay under 0.1% across days."
+   - *Answer:* "Nothing bad—it's strictly a negative cache! On a Bloom miss, we know 100% the key isn't in RocksDB and skip the disk read. On a Bloom hit (or if a bucket exceeds its saturation threshold), we **always verify in RocksDB `WindowStore`**, so false positives cost one local lookup and never drop a valid invoice. Plus we use a 3-bucket `TimeBucketedBloomFilter` spanning the full retention window so false positives stay at ~0.0001% (99.9999% skip rate across 3.61M keys)."
 4. **"What if your RocksDB dedupe store grows to billions of keys or we need to increase partition count?"**
    - *Answer:* "Today our `WindowStore` bounds disk growth via configurable `retention-ms` with O(1) RocksDB segment deletion. However, changing `invoice-events` partition count during an active retention window would remap `hash(invoiceId)` to a different task without historical state. So for Stage 3 (1M/s elastic partition scaling), the roadmap moves exact dedupe to a partitioned external ledger (ScyllaDB/Cassandra LWT with `CLAIMED -> EMITTED`) while keeping the exact same delta-topic + projector architecture."
 5. **"What happens if Kafka or Redis slows down under a traffic spike?"**

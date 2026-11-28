@@ -17,32 +17,35 @@ public class KafkaConfig {
     @Bean
     NewTopic invoiceEventsTopic(
             @Value("${app.kafka.topic}") String topic,
-            @Value("${app.kafka.partitions:12}") int partitions
+            @Value("${app.kafka.partitions:12}") int partitions,
+            @Value("${app.kafka.replication-factor:1}") int replicationFactor
     ) {
         return TopicBuilder.name(topic)
                 .partitions(partitions)
-                .replicas(1)
+                .replicas(replicationFactor)
                 .build();
     }
 
     @Bean
     NewTopic companyRewardDeltasTopic(
             @Value("${app.kafka.delta-topic}") String topic,
-            @Value("${app.kafka.partitions:12}") int partitions
+            @Value("${app.kafka.partitions:12}") int partitions,
+            @Value("${app.kafka.replication-factor:1}") int replicationFactor
     ) {
         return TopicBuilder.name(topic)
                 .partitions(partitions)
-                .replicas(1)
+                .replicas(replicationFactor)
                 .build();
     }
 
     @Bean
     NewTopic invoiceEventsDltTopic(
-            @Value("${app.kafka.dlt-topic}") String topic
+            @Value("${app.kafka.dlt-topic}") String topic,
+            @Value("${app.kafka.replication-factor:1}") int replicationFactor
     ) {
         return TopicBuilder.name(topic)
                 .partitions(1)
-                .replicas(1)
+                .replicas(replicationFactor)
                 .build();
     }
 

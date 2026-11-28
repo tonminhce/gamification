@@ -9,6 +9,7 @@ import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.http.converter.HttpMessageNotReadableException;
 import org.springframework.validation.FieldError;
+import org.springframework.validation.ObjectError;
 import org.springframework.web.HttpMediaTypeNotSupportedException;
 import org.springframework.web.bind.MethodArgumentNotValidException;
 import org.springframework.web.bind.MissingServletRequestParameterException;
@@ -27,10 +28,10 @@ public class ApiExceptionHandler {
 
     @ExceptionHandler(MethodArgumentNotValidException.class)
     ResponseEntity<ApiErrorResponse> handleValidation(MethodArgumentNotValidException ex) {
-        String message = ex.getBindingResult().getFieldErrors().stream()
-                .map(this::formatFieldError)
+        String message = ex.getBindingResult().getAllErrors().stream()
+                .map(this::formatValidationError)
                 .collect(Collectors.joining("; "));
-        return error(HttpStatus.BAD_REQUEST, message);
+        return error(HttpStatus.BAD_REQUEST, message.isBlank() ? "Validation failed" : message);
     }
 
     @ExceptionHandler(ConstraintViolationException.class)
@@ -77,11 +78,13 @@ public class ApiExceptionHandler {
 
     @ExceptionHandler(EventPublishException.class)
     ResponseEntity<ApiErrorResponse> handlePublishFailure(EventPublishException ex) {
+        log.error("Kafka publish failure returned 503", ex);
         return error(HttpStatus.SERVICE_UNAVAILABLE, ex.getMessage());
     }
 
     @ExceptionHandler(DataAccessException.class)
     ResponseEntity<ApiErrorResponse> handleRedisFailure(DataAccessException ex) {
+        log.error("Redis data access failure returned 503", ex);
         return error(HttpStatus.SERVICE_UNAVAILABLE, "Redis is unavailable");
     }
 
@@ -91,8 +94,11 @@ public class ApiExceptionHandler {
         return error(HttpStatus.INTERNAL_SERVER_ERROR, "Unexpected server error");
     }
 
-    private String formatFieldError(FieldError error) {
-        return error.getField() + ": " + error.getDefaultMessage();
+    private String formatValidationError(ObjectError error) {
+        if (error instanceof FieldError fieldError) {
+            return fieldError.getField() + ": " + fieldError.getDefaultMessage();
+        }
+        return error.getObjectName() + ": " + error.getDefaultMessage();
     }
 
     private ResponseEntity<ApiErrorResponse> error(HttpStatus status, String message) {

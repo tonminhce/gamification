@@ -7,6 +7,7 @@ import com.vnpt.einvoice.gamification.leaderboard.LeaderboardController;
 import com.vnpt.einvoice.gamification.leaderboard.LeaderboardService;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.springframework.dao.DataAccessResourceFailureException;
 import org.springframework.http.MediaType;
 import org.springframework.test.web.servlet.MockMvc;
 import org.springframework.test.web.servlet.setup.MockMvcBuilders;
@@ -25,13 +26,15 @@ class ApiExceptionHandlerTest {
 
     private MockMvc mvc;
     private InvoiceEventPublisher publisher;
+    private LeaderboardService leaderboardService;
 
     @BeforeEach
     void setUp() {
         publisher = mock(InvoiceEventPublisher.class);
+        leaderboardService = mock(LeaderboardService.class);
         mvc = MockMvcBuilders.standaloneSetup(
                         new InvoiceController(publisher),
-                        new LeaderboardController(mock(LeaderboardService.class))
+                        new LeaderboardController(leaderboardService)
                 )
                 .setControllerAdvice(new ApiExceptionHandler())
                 .build();
@@ -103,5 +106,27 @@ class ApiExceptionHandlerTest {
                 .andExpect(status().isServiceUnavailable())
                 .andExpect(header().string("Retry-After", "1"))
                 .andExpect(jsonPath("$.status").value(503));
+    }
+
+    @Test
+    void kafkaPublishFailureReturnsServiceUnavailable() throws Exception {
+        when(publisher.publish(any())).thenThrow(new EventPublishException("Kafka rejected the invoice event", new RuntimeException("down")));
+
+        mvc.perform(post("/api/invoices/simulate")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"invoiceId\":\"INV-1\",\"companyId\":\"COMPANY-A\"}"))
+                .andExpect(status().isServiceUnavailable())
+                .andExpect(jsonPath("$.status").value(503))
+                .andExpect(jsonPath("$.message").value("Kafka rejected the invoice event"));
+    }
+
+    @Test
+    void redisFailureReturnsServiceUnavailable() throws Exception {
+        when(leaderboardService.top(10)).thenThrow(new DataAccessResourceFailureException("Redis down"));
+
+        mvc.perform(get("/api/leaderboard/top").param("limit", "10"))
+                .andExpect(status().isServiceUnavailable())
+                .andExpect(jsonPath("$.status").value(503))
+                .andExpect(jsonPath("$.message").value("Redis is unavailable"));
     }
 }

@@ -432,6 +432,107 @@
       "junitAndTestcontainersTests": "36 passed (including real Kafka+Redis E2E)"
     }
   },
+  "stage2CHardened": {
+    "measuredAt": "2026-11-28T03:29:42Z",
+    "environment": {
+      "os": "macOS arm64 (Apple M4, 10 cores)",
+      "docker": "29.7.2",
+      "java": "Temurin 25.0.3 (Virtual Threads enabled)",
+      "springBoot": "4.2.0",
+      "kafka": "4.4.0 single node, 12 partitions",
+      "redis": "7.4.12 single node with AOF",
+      "hostContentionNote": "Measured while unrelated baseline Kafka (51.5% CPU) and Postgres (36.9% CPU) containers were active on the same Docker Desktop VM, limiting single-node broker ack rate to 45k-53k/s while backlog drain still reached 156k/s and concurrent Top-100 read P95 dropped to 3.54-8.32 ms."
+    },
+    "configuration": {
+      "producerKey": "invoiceId (enforced at ingress and topology validRecord)",
+      "streamsThreads": 6,
+      "commitIntervalMs": 500,
+      "invoiceDedupe": "Bounded-retention RocksDB WindowStore (24h default) + 3-bucket TimeBucketedBloomFilter (64-bit FNV-1a, saturation fallback) + expired-timestamp & conflict DLT quarantine",
+      "rocksdb": "Shared 256 MB LRUCache (CACHE_LOCK ref-counted), 16 MB per-store write buffer, 16 KB blocks, per-instance native SST BloomFilter(10.0), LZ4 compression",
+      "window": "500 ms event-time, 100 ms TreeMap-indexed wall-clock punctuation with caching-enabled RocksDB store and WindowAccum primitive byte codecs",
+      "projector": "12 batch listeners, read_committed, multi-partition grouping, offset checkpoint, daily TTL delta Sets, verified PENDING rollback-safe crash recovery",
+      "readPath": "Atomic 1-RTT rank_and_score.lua + consolidated top-100 50 ms initLock single-flight stale-while-revalidate cache"
+    },
+    "directKafka1MRuns": [
+      {
+        "runId": "DIRECT-1795836400575",
+        "producerAckedEventsPerSecond": 53608.68,
+        "endToEndEventsPerSecond": 51252.00,
+        "backlogDrainEventsPerSecond": 44939.26,
+        "postDrainLeaderboardP95Ms": 0.71,
+        "underLoadLeaderboardP95Ms": 8.32,
+        "underLoadLeaderboardP99Ms": 30.68,
+        "underLoadReadSamples": 17916,
+        "expectedAddedPoints": 10000000,
+        "observedAddedPoints": 10000000,
+        "duplicateReplayVerified": 10000
+      },
+      {
+        "runId": "DIRECT-1795836423880",
+        "producerAckedEventsPerSecond": 46204.63,
+        "endToEndEventsPerSecond": 44661.26,
+        "backlogDrainEventsPerSecond": 53627.65,
+        "postDrainLeaderboardP95Ms": 1.06,
+        "underLoadLeaderboardP95Ms": 3.54,
+        "underLoadLeaderboardP99Ms": 14.53,
+        "underLoadReadSamples": 23955,
+        "expectedAddedPoints": 10000000,
+        "observedAddedPoints": 10000000,
+        "duplicateReplayVerified": 10000
+      },
+      {
+        "runId": "DIRECT-1795836450014",
+        "producerAckedEventsPerSecond": 45761.94,
+        "endToEndEventsPerSecond": 44408.31,
+        "backlogDrainEventsPerSecond": 156002.59,
+        "postDrainLeaderboardP95Ms": 0.29,
+        "underLoadLeaderboardP95Ms": 4.31,
+        "underLoadLeaderboardP99Ms": 17.29,
+        "underLoadReadSamples": 23368,
+        "expectedAddedPoints": 10000000,
+        "observedAddedPoints": 10000000,
+        "duplicateReplayVerified": 10000
+      }
+    ],
+    "restBatch500kRun": {
+      "runId": "REST-1795836475469",
+      "totalUniqueEvents": 500000,
+      "batchSize": 1000,
+      "concurrency": 24,
+      "apiAcceptedEventsPerSecond": 77716.76,
+      "restEndToEndEventsPerSecond": 58765.08,
+      "leaderboardP95Ms": 1.27,
+      "overload503Retries": 810,
+      "expectedAddedPoints": 5000000,
+      "observedAddedPoints": 5000000
+    },
+    "restSingle10kRun": {
+      "runId": "REST-1795836486310",
+      "totalUniqueEvents": 10000,
+      "batchSize": 1,
+      "concurrency": 200,
+      "apiAcceptedEventsPerSecond": 9205.77,
+      "restEndToEndEventsPerSecond": 4982.80,
+      "leaderboardP95Ms": 1.73,
+      "expectedAddedPoints": 100000,
+      "observedAddedPoints": 100000
+    },
+    "correctnessAndEfficiency": {
+      "totalUniqueProcessedInSession": 3610000,
+      "bloomNegativeSkips": 3609997,
+      "bloomFalsePositives": 3,
+      "bloomAccuracyPercent": 99.9999,
+      "duplicateEventsVerified": 40000,
+      "windowsEmitted": 109504,
+      "redisLuaBatches": 2978,
+      "publishFailures": 0,
+      "rocksdbDiskSize": "32 MB",
+      "gracefulRestartRestoreSeconds": 30.41,
+      "postRestartReplayAndConflictPointsAdded": 0,
+      "freshInvoiceAfterRestartPoints": 10,
+      "junitAndTestcontainersTests": "49 passed (including real Kafka+Redis E2E, zero compiler warnings)"
+    }
+  },
   "baselineBeforeOptimization": {
     "endToEndEventsPerSecond": 5602.61,
     "leaderboardP95Ms": 5.051,

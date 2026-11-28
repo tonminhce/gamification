@@ -20,6 +20,7 @@ import java.time.Instant;
 import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -84,17 +85,34 @@ class LeaderboardApplyServiceIntegrationTest {
     }
 
     @Test
+    void appliesMultiDayBucketBatchWithoutCrossDayCollision() {
+        Instant day1 = Instant.parse("2026-11-27T23:59:59Z");
+        Instant day2 = Instant.parse("2026-11-28T00:00:01Z");
+        long epochDay1 = day1.getEpochSecond() / 86_400L;
+        long epochDay2 = day2.getEpochSecond() / 86_400L;
+
+        List<CompanyRewardDelta> deltas = List.of(
+                delta("D-MID-1", "COMPANY-A", 10, day1),
+                delta("D-MID-2", "COMPANY-A", 20, day2)
+        );
+
+        assertEquals(2, service.applyDeltas(deltas, "partition-cross"));
+        assertEquals(30.0, redisTemplate.opsForZSet().score(LEADERBOARD, "COMPANY-A"));
+        assertTrue(Boolean.TRUE.equals(redisTemplate.opsForSet().isMember(PROCESSED_DELTAS + ":" + epochDay1, "D-MID-1")));
+        assertTrue(Boolean.TRUE.equals(redisTemplate.opsForSet().isMember(PROCESSED_DELTAS + ":" + epochDay2, "D-MID-2")));
+        assertEquals(0, service.applyDeltas(deltas, "partition-cross"));
+    }
+
+    @Test
     void skipsCheckpointedOffsetsAndHandlesControlRecordGaps() {
         Instant now = Instant.parse("2026-11-28T01:00:00Z");
         List<ConsumerRecord<String, CompanyRewardDelta>> firstPoll = List.of(
                 record(delta("D-10", "COMPANY-A", 10, now), 10),
-                // Offset 11 intentionally absent (simulating Kafka EOS control/abort gap)
                 record(delta("D-12", "COMPANY-B", 20, now), 12)
         );
         assertEquals(2, service.applyPartitionBatch(firstPoll, "company-reward-deltas:0"));
         assertEquals("12", redisTemplate.opsForValue().get("einv:projector-checkpoint:company-reward-deltas:0"));
 
-        // Re-deliver offset <= 12 even with a distinct deltaId; checkpoint blocks it.
         List<ConsumerRecord<String, CompanyRewardDelta>> redelivery = List.of(
                 record(delta("D-11-NEW", "COMPANY-A", 999, now), 11),
                 record(delta("D-12-NEW", "COMPANY-B", 999, now), 12)
@@ -103,7 +121,6 @@ class LeaderboardApplyServiceIntegrationTest {
         assertEquals(10.0, redisTemplate.opsForZSet().score(LEADERBOARD, "COMPANY-A"));
         assertEquals(20.0, redisTemplate.opsForZSet().score(LEADERBOARD, "COMPANY-B"));
 
-        // Offset 15 advances checkpoint and applies cleanly.
         assertEquals(1, service.applyPartitionBatch(
                 List.of(record(delta("D-15", "COMPANY-A", 50, now), 15)),
                 "company-reward-deltas:0"
@@ -113,30 +130,43 @@ class LeaderboardApplyServiceIntegrationTest {
     }
 
     @Test
-    void recoversPendingMarkerAndRejectsPartialMismatch() {
+    void recoversPendingMarkerAtomicallyAndRejectsPartialMismatchWithoutMutatingRedis() {
         Instant now = Instant.parse("2026-11-28T01:00:00Z");
         long epochDay = now.getEpochSecond() / 86_400L;
         String bucketKey = PROCESSED_DELTAS + ":" + epochDay;
 
-        // Seed PENDING marker as if a crash occurred before applyBatch ran.
-        String pendingJson = """
-                {"state":"PENDING","buckets":[{"key":"%s","ids":["D-CRASH-1"]}],"companies":[{"companyId":"COMPANY-R","deltaPoints":40,"scoreBefore":0}]}
+        // Pre-seed COMP-ALREADY at scoreAfter (100) while COMP-PENDING is still at scoreBefore (0).
+        redisTemplate.opsForZSet().add(LEADERBOARD, "COMP-ALREADY", 100.0);
+        String mixedPendingJson = """
+                {"state":"PENDING","buckets":[{"key":"%s","ids":["D-CRASH-MIX"]}],"companies":[{"companyId":"COMP-ALREADY","deltaPoints":40,"scoreBefore":60},{"companyId":"COMP-PENDING","deltaPoints":20,"scoreBefore":0}]}
                 """.formatted(bucketKey).trim();
-        redisTemplate.opsForValue().set("einv:delta-batch:company-reward-deltas:1", pendingJson);
+        redisTemplate.opsForValue().set("einv:delta-batch:company-reward-deltas:1", mixedPendingJson);
 
-        assertEquals(0, service.applyDeltas(List.of(delta("D-CRASH-1", "COMPANY-R", 40, now)), "company-reward-deltas:1"));
-        assertEquals(40.0, redisTemplate.opsForZSet().score(LEADERBOARD, "COMPANY-R"));
+        assertEquals(0, service.applyDeltas(List.of(delta("D-CRASH-MIX", "COMP-PENDING", 20, now)), "company-reward-deltas:1"));
+        assertEquals(100.0, redisTemplate.opsForZSet().score(LEADERBOARD, "COMP-ALREADY"));
+        assertEquals(20.0, redisTemplate.opsForZSet().score(LEADERBOARD, "COMP-PENDING"));
         assertNull(redisTemplate.opsForValue().get("einv:delta-batch:company-reward-deltas:1"));
 
-        // Now seed a conflicting PENDING marker whose scoreBefore matches neither current nor expected.
+        // Mismatch on second company must NOT mutate COMP-ALREADY or write D-BAD to the processed set.
         String badMarker = """
-                {"state":"PENDING","buckets":[{"key":"%s","ids":["D-BAD"]}],"companies":[{"companyId":"COMPANY-R","deltaPoints":10,"scoreBefore":5}]}
+                {"state":"PENDING","buckets":[{"key":"%s","ids":["D-BAD"]}],"companies":[{"companyId":"COMP-ALREADY","deltaPoints":10,"scoreBefore":100},{"companyId":"COMP-PENDING","deltaPoints":10,"scoreBefore":5}]}
                 """.formatted(bucketKey).trim();
         redisTemplate.opsForValue().set("einv:delta-batch:company-reward-deltas:1", badMarker);
 
         assertThrows(
                 DataAccessException.class,
-                () -> service.applyDeltas(List.of(delta("D-NEW", "COMPANY-R", 10, now)), "company-reward-deltas:1")
+                () -> service.applyDeltas(List.of(delta("D-NEW", "COMP-PENDING", 10, now)), "company-reward-deltas:1")
+        );
+        assertEquals(100.0, redisTemplate.opsForZSet().score(LEADERBOARD, "COMP-ALREADY"));
+        assertFalse(Boolean.TRUE.equals(redisTemplate.opsForSet().isMember(bucketKey, "D-BAD")));
+    }
+
+    @Test
+    void rejectsNonPositiveDeltaPointsInLua() {
+        Instant now = Instant.parse("2026-11-28T01:00:00Z");
+        assertThrows(
+                DataAccessException.class,
+                () -> service.applyDeltas(List.of(delta("D-ZERO", "COMP-Z", 0, now)), "p0")
         );
     }
 

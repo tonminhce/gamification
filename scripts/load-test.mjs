@@ -65,19 +65,26 @@ async function waitForExpectedPoints(expectedPoints, timeoutMs = 60_000) {
   throw new Error(`Timed out waiting for ${expectedPoints} points; observed ${await totalPoints()}`);
 }
 
-function kafkaLag() {
+function consumerGroupLag(groupId) {
   const output = execFileSync("docker", [
     "compose", "exec", "-T", "kafka",
     "/opt/kafka/bin/kafka-consumer-groups.sh",
     "--bootstrap-server", kafkaBootstrap,
-    "--describe", "--group", "einvoice-gamification",
+    "--describe", "--group", groupId,
   ], { encoding: "utf8" });
 
-  return output.trim().split("\n").slice(1).reduce((sum, line) => {
+  return output.trim().split("\n").reduce((sum, line) => {
     const columns = line.trim().split(/\s+/);
     const lag = columns[5];
-    return sum + (lag === undefined || lag === "-" ? 0 : Number(lag));
+    if (columns.length < 6 || lag === undefined || lag === "-" || !/^\d+$/.test(lag)) {
+      return sum;
+    }
+    return sum + Number(lag);
   }, 0);
+}
+
+function kafkaLag() {
+  return consumerGroupLag("einvoice-reward-streams") + consumerGroupLag("einvoice-gamification");
 }
 
 async function waitForZeroLag(timeoutMs = 30_000) {

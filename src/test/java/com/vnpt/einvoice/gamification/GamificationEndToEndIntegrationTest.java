@@ -152,15 +152,22 @@ class GamificationEndToEndIntegrationTest {
         });
         assertTrue(sawConflictHeader, "Expected conflict record with x-dlt-reason header in DLT");
 
-        // 7. Verify Actuator health and Micrometer dedupe/projector metrics
+        // 7. Verify Actuator health (including kafkaStreams) and Micrometer dedupe/projector metrics
         JsonNode health = getJson("/actuator/health");
         assertEquals("UP", health.path("status").asString());
+        assertEquals("UP", health.path("components").path("kafkaStreams").path("status").asString());
 
-        JsonNode dupMetric = getJson("/actuator/metrics/gamification.streams.dedupe.duplicate");
-        assertTrue(dupMetric.path("measurements").get(0).path("value").asDouble() >= 3.0);
+        waitForMetricAtLeast("gamification.streams.dedupe.duplicate", 3.0);
+        waitForMetricAtLeast("gamification.streams.dedupe.conflict", 1.0);
 
-        JsonNode conflictMetric = getJson("/actuator/metrics/gamification.streams.dedupe.conflict");
-        assertTrue(conflictMetric.path("measurements").get(0).path("value").asDouble() >= 1.0);
+        // 8. Verify PathVariable Bean Validation rejects oversized companyId
+        HttpRequest invalidCompanyReq = HttpRequest.newBuilder(
+                        URI.create("http://localhost:" + port + "/api/companies/" + "C".repeat(65) + "/points"))
+                .timeout(Duration.ofSeconds(5))
+                .GET()
+                .build();
+        HttpResponse<String> invalidCompanyResp = http.send(invalidCompanyReq, HttpResponse.BodyHandlers.ofString());
+        assertEquals(400, invalidCompanyResp.statusCode());
     }
 
     private void sendInvalidAndPoisonEventsToKafka() throws Exception {
@@ -215,6 +222,21 @@ class GamificationEndToEndIntegrationTest {
             Thread.sleep(50);
         }
         assertEquals(expectedPoints, observed, "Timed out waiting for points on " + companyId);
+    }
+
+    private void waitForMetricAtLeast(String metricName, double minExpected) throws Exception {
+        long deadline = System.nanoTime() + Duration.ofSeconds(15).toNanos();
+        double observed = 0.0;
+        while (System.nanoTime() < deadline) {
+            observed = getJson("/actuator/metrics/" + metricName)
+                    .path("measurements").get(0).path("value").asDouble();
+            if (observed >= minExpected) {
+                return;
+            }
+            Thread.sleep(50);
+        }
+        assertTrue(observed >= minExpected,
+                "Timed out waiting for metric " + metricName + " >= " + minExpected + ", observed=" + observed);
     }
 
     private HttpResponse<String> postJson(String path, Object payload) throws Exception {
